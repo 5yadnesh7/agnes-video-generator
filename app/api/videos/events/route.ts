@@ -1,4 +1,5 @@
 import { agnesPollDelayMs, POLL_CAP_MS } from "@/lib/agnes/constants";
+import { pollAgnesKey } from "@/lib/agnes/api-key";
 import type { JobStatus } from "@/lib/agnes/types";
 import { parseStatusQuery, parsePollResponse, pollVideo } from "@/lib/agnes/upstream";
 
@@ -97,7 +98,9 @@ export async function GET(request: Request): Promise<Response> {
             break;
           }
 
-          const result = await parsePollResponse(await pollVideo(videoId, modelName, ac.signal));
+          const result = await parsePollResponse(
+            await pollVideo(videoId, modelName, ac.signal, pollAgnesKey(request)),
+          );
           if (ac.signal.aborted) break;
 
           if (result.ok) {

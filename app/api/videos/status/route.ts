@@ -1,3 +1,4 @@
+import { pollAgnesKey } from "@/lib/agnes/api-key";
 import { pollVideo, parseStatusQuery } from "@/lib/agnes/upstream";
 
 export const maxDuration = 30;
@@ -11,5 +12,5 @@ export async function GET(request: Request): Promise<Response> {
   if (!parsed.ok) {
     return Response.json({ detail: parsed.detail }, { status: 400 });
   }
-  return pollVideo(parsed.videoId, parsed.modelName);
+  return pollVideo(parsed.videoId, parsed.modelName, undefined, pollAgnesKey(request));
 }

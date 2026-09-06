@@ -56,7 +56,7 @@ const IMAGE_ACCEPT = ".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp";
 const AUDIO_ACCEPT = "audio/mpeg,audio/wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.aac,.mp4";
 const MP4_HINT =
   "If the player fails, the file host may be unreachable on this network. Try another network or DNS. Do not disable TLS.";
-const KEY_BANNER = "Set AGNES_API_KEY in .env.local and restart next dev.";
+const KEY_BANNER = "Add an Agnes API key in the header, or set AGNES_API_KEY in .env and restart.";
 
 type FieldErrors = Partial<Record<string, string>>;
 
@@ -667,6 +667,7 @@ export function GenerateForm() {
   const [errors, setErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [keyMissing, setKeyMissing] = useState(false);
+  const [agnesApiKey, setAgnesApiKey] = useState("");
   const [job, setJob] = useState<JobView>({ phase: "idle" });
 
   const pollAbort = useRef<AbortController | null>(null);
@@ -1301,10 +1302,14 @@ export function GenerateForm() {
 
     setJob({ phase: "posting" });
     try {
+      const payload: Record<string, unknown> = { ...built.request };
+      const typedKey = agnesApiKey.trim();
+      if (typedKey) payload.agnes_api_key = typedKey;
       const res = await fetch("/api/videos", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(built.request),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const detail = await readDetail(res);
@@ -1332,7 +1337,18 @@ export function GenerateForm() {
     <div className="app">
       <header className="shell">
         <p className="brand">Agnes Video</p>
-        <p className="key-note">API key stays on the server. This page never sends it.</p>
+        <div className="key-field">
+          <label htmlFor="agnes-api-key">Agnes API key</label>
+          <input
+            id="agnes-api-key"
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="Optional"
+            value={agnesApiKey}
+            onChange={(e) => setAgnesApiKey(e.target.value)}
+          />
+        </div>
         <div className="shell-actions">
           <fieldset className="seg" style={{ border: 0, margin: 0 }}>
             <legend className="visually-hidden">Theme</legend>

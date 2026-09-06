@@ -114,11 +114,8 @@ function humanizeDetail(detail: string): string {
   return detail;
 }
 
-function getApiKey(): string | null {
-  const key = process.env.AGNES_API_KEY;
-  if (typeof key !== "string") return null;
-  const trimmed = key.trim();
-  return trimmed.length > 0 ? trimmed : null;
+function missingKeyCopy(): string {
+  return "Add an Agnes API key in the header, or set AGNES_API_KEY in .env and restart.";
 }
 
 async function parseJsonSafe(res: Response): Promise<unknown> {
@@ -267,10 +264,11 @@ function networkError(err: unknown): Response {
 export async function createVideo(
   body: Record<string, unknown>,
   pollModel: ModelId,
+  apiKey: string | null,
 ): Promise<Response> {
-  const key = getApiKey();
+  const key = apiKey;
   if (!key) {
-    return jsonError(401, "Set AGNES_API_KEY in .env.local and restart next dev.");
+    return jsonError(401, missingKeyCopy());
   }
 
   try {
@@ -292,10 +290,11 @@ export async function pollVideo(
   videoId: string,
   modelName: ModelId,
   signal?: AbortSignal,
+  apiKey?: string | null,
 ): Promise<Response> {
-  const key = getApiKey();
+  const key = apiKey ?? null;
   if (!key) {
-    return jsonError(401, "Set AGNES_API_KEY in .env.local and restart next dev.");
+    return jsonError(401, missingKeyCopy());
   }
 
   const params = new URLSearchParams({

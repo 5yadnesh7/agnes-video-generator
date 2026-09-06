@@ -1,4 +1,10 @@
 import { MODEL_V20 } from "@/lib/agnes/constants";
+import {
+  clearOverrideCookie,
+  envApiKey,
+  overrideFromBody,
+  setOverrideCookie,
+} from "@/lib/agnes/api-key";
 import { buildCreateBody, parseCreateRequest } from "@/lib/agnes/payloads";
 import { createVideo } from "@/lib/agnes/upstream";
 import type { CreateRequest } from "@/lib/agnes/types";
@@ -37,6 +43,9 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ detail: "Invalid JSON." }, { status: 400 });
   }
 
+  const override = isRecord(json) ? overrideFromBody(json.agnes_api_key) : null;
+  const key = override ?? envApiKey();
+
   const parsed = parseCreateRequest(json);
   if (!parsed.ok) {
     return Response.json({ detail: parsed.detail }, { status: 400 });
@@ -59,5 +68,12 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ detail }, { status: 400 });
   }
 
-  return createVideo(body, parsed.value.model);
+  const res = await createVideo(body, parsed.value.model, key);
+  const headers = new Headers(res.headers);
+  headers.set("Set-Cookie", override ? setOverrideCookie(override) : clearOverrideCookie());
+  return new Response(res.body, { status: res.status, headers });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

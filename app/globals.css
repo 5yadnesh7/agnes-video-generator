@@ -66,11 +66,17 @@ a {
   font-size: 1.05rem;
 }
 
-.key-note {
-  color: var(--muted);
-  font-size: 0.82rem;
-  margin: 0;
+.key-field {
   flex: 1 1 14rem;
+  min-width: 12rem;
+  max-width: 22rem;
+}
+
+.key-field label {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0 0 0.2rem;
 }
 
 .shell-actions {
@@ -78,6 +84,7 @@ a {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
+  margin-left: auto;
 }
 
 .visually-hidden {
@@ -280,10 +287,6 @@ video:focus-visible {
     padding: 0.55rem 0.9rem;
   }
 
-  .key-note {
-    display: none;
-  }
-
   .layout {
     grid-template-areas:
       "job"
@@ -396,6 +399,7 @@ textarea,
 input[type="number"],
 input[type="url"],
 input[type="text"],
+input[type="password"],
 input[type="file"] {
   width: 100%;
   font: inherit;
