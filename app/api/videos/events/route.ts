@@ -4,7 +4,10 @@ import { parseStatusQuery, parsePollResponse, pollVideo } from "@/lib/agnes/upst
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 930;
+/** Hobby Fluid max is 300s; 930 was over every Vercel plan and failed deploy after `next build`. */
+export const maxDuration = 300;
+
+const STREAM_CAP_MS = process.env.VERCEL ? 280_000 : POLL_CAP_MS;
 
 const BACKOFF_MS = [3000, 6000, 8000] as const;
 const NET_RETRY_LIMIT = 3;
@@ -82,14 +85,14 @@ export async function GET(request: Request): Promise<Response> {
         let lastStatus: JobStatus | undefined;
 
         while (!ac.signal.aborted) {
-          if (Date.now() - startedAt >= POLL_CAP_MS) {
+          if (Date.now() - startedAt >= STREAM_CAP_MS) {
             emit("timeout", lastStatus ? { status: lastStatus } : {});
             break;
           }
 
           if (delay > 0) await sleep(delay, ac.signal);
 
-          if (Date.now() - startedAt >= POLL_CAP_MS) {
+          if (Date.now() - startedAt >= STREAM_CAP_MS) {
             emit("timeout", lastStatus ? { status: lastStatus } : {});
             break;
           }
