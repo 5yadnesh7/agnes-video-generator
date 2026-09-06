@@ -44,7 +44,10 @@ const EXT_MIME: Record<string, string> = {
 type Meta = { contentType: string; filename: string };
 
 function uploadsDir(): string {
-  return path.resolve(process.cwd(), ".data", "uploads");
+  if (process.env.VERCEL) {
+    return path.join("/tmp", "agnes-uploads");
+  }
+  return path.join(process.cwd(), ".data", "uploads");
 }
 
 function extOf(name: string): string {
@@ -88,7 +91,7 @@ async function runPurge(): Promise<void> {
   const dir = uploadsDir();
   let names: string[];
   try {
-    names = await readdir(dir);
+    names = await readdir(/* turbopackIgnore: true */ dir);
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return;
     throw err;
@@ -109,7 +112,7 @@ async function runPurge(): Promise<void> {
       let newest = 0;
       for (const p of [filePath, metaPath]) {
         try {
-          const st = await stat(p);
+          const st = await stat(/* turbopackIgnore: true */ p);
           newest = Math.max(newest, st.mtimeMs);
         } catch {
           /* missing half of a pair */
@@ -125,7 +128,7 @@ async function runPurge(): Promise<void> {
 function resolveUploadPath(id: string): string | null {
   if (!isMediaId(id)) return null;
   const root = uploadsDir();
-  const filePath = path.resolve(root, id);
+  const filePath = path.join(root, id);
   const rel = path.relative(root, filePath);
   if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
   return filePath;
@@ -188,7 +191,7 @@ export async function saveUpload(
   await purgeExpiredUploads();
   const id = crypto.randomUUID();
   const dir = uploadsDir();
-  await mkdir(dir, { recursive: true });
+  await mkdir(/* turbopackIgnore: true */ dir, { recursive: true });
   const filePath = resolveUploadPath(id);
   if (!filePath) throw new Error("Could not store this file.");
   const metaPath = `${filePath}.json`;
