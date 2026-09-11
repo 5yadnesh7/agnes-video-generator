@@ -3,11 +3,30 @@ export const MODEL_FLASH = "agnes-video-2.5-flash" as const;
 
 export const POLL_CAP_MS = 15 * 60 * 1000;
 
+export const STORY_CREATE_GAP_MS = 65_000;
+export const STORY_SCENE_MIN = 2;
+export const STORY_MINUTES_MIN = 1;
+export const STORY_MINUTES_MAX = 10;
+export const STORY_MINUTES_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as const;
+export const STORY_DEFAULT_MINUTES = 1;
+export const STORY_MAX_TOTAL_SEC = STORY_MINUTES_MAX * 60;
+/** JSON/merge safety only: 10 min at Flash's shortest clip. Product cap is 10 min, not scene count. */
+export const STORY_SCENE_HARD_MAX = 150;
+export const STORY_CHARACTER_MAX = 5;
+
 /** Sleep before the Agnes status call at this 0-based index. First call is at 30s, not t=0. */
 export function agnesPollDelayMs(pollIndex: number): number {
   const i = Math.max(0, pollIndex);
   if (i <= 1) return 30_000;
   if (i <= 4) return 20_000;
+  return 10_000;
+}
+
+/** Story SSE: time-based delay from stream start. First wait is 30s (not t=0). */
+export function storyPollDelayMs(elapsedMs: number): number {
+  const elapsed = Math.max(0, elapsedMs);
+  if (elapsed < 120_000) return 30_000;
+  if (elapsed < 240_000) return 20_000;
   return 10_000;
 }
 
@@ -50,6 +69,10 @@ export const V20_I2V_MAX = 1;
 export const DEFAULT_V20_NEGATIVE_PROMPT =
   "spritesheet, character sheet, turnaround sheet, model sheet, pose grid, comic panels, split screen, collage, slideshow of stills, different character than reference, outfit change, extra limbs, warped face, extra characters, text overlay, watermark, logo, blurry, low quality";
 
+/** Story clips: sheet is a reference only — never the picture. */
+export const STORY_V20_NEGATIVE_PROMPT =
+  "spritesheet, character sheet, turnaround sheet, model sheet, pose grid, comic panels, split screen, collage, slideshow of stills, multiple panels, storyboard frames, different character than reference, outfit change, extra limbs, warped face, unnamed extra people, duplicate clones, on-screen subtitles, text overlay, watermark, logo, blurry, low quality, still photo";
+
 /** Shown under v2.0 image / keyframes pickers. Positive instruction, not a negative. */
 export const V20_REFERENCE_HINT =
   "Keep identity from the reference; the sheet is not the video.";
@@ -64,6 +87,19 @@ export const FLASH_IMAGE_MAX = 5;
 export const FLASH_AUDIO_MAX = 3;
 
 export const THEME_STORAGE_KEY = "agnes-theme";
+
+export const IMAGE_MODELS = [
+  { id: "agnes-image-2.0-flash", label: "Agnes Image 2.0 Flash" },
+  { id: "agnes-image-2.1-flash", label: "Agnes Image 2.1 Flash" },
+  { id: "agnes-image-2.5-flash", label: "Agnes Image 2.5 Flash" },
+] as const;
+export type ImageModelId = (typeof IMAGE_MODELS)[number]["id"];
+/** Current story default — 2.1 Flash. */
+export const DEFAULT_IMAGE_MODEL: ImageModelId = "agnes-image-2.1-flash";
+
+export function isImageModelId(value: unknown): value is ImageModelId {
+  return typeof value === "string" && IMAGE_MODELS.some((m) => m.id === value);
+}
 
 export const V20_ASPECTS = ["16:9", "9:16", "1:1", "4:3", "3:4"] as const;
 
@@ -166,6 +202,107 @@ export function clampV20Duration(
 
 export function isValidNumFrames(value: number): boolean {
   return Number.isInteger(value) && value >= MIN_FRAMES && value <= MAX_FRAMES && (value - 1) % 8 === 0;
+}
+
+export function nearestV20Duration(
+  durationSec: number,
+  fps: number,
+  maxFrames: number,
+): V20Duration {
+  const allowed = allowedV20Durations(fps, maxFrames);
+  if (allowed.length === 0) return DEFAULT_DURATION_SEC;
+  if (allowed.includes(durationSec as V20Duration) && isDurationAllowed(durationSec, fps, maxFrames)) {
+    return durationSec as V20Duration;
+  }
+  let best = allowed[0];
+  let bestDist = Math.abs(durationSec - best);
+  for (const option of allowed) {
+    const dist = Math.abs(durationSec - option);
+    if (dist < bestDist) {
+      best = option;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+export function snapStoryDuration(
+  durationSec: number,
+  model: typeof MODEL_V20 | typeof MODEL_FLASH,
+  fps: number = DEFAULT_FRAME_RATE,
+  maxFrames: number = V20_MAX_FRAMES["720p"],
+): number {
+  if (model === MODEL_FLASH) {
+    const n = Math.round(durationSec);
+    if (!Number.isFinite(n)) return FLASH_SECONDS_MIN;
+    return Math.min(FLASH_SECONDS_MAX, Math.max(FLASH_SECONDS_MIN, n));
+  }
+  return nearestV20Duration(durationSec, fps, maxFrames);
+}
+
+export function storyTiming(
+  model: typeof MODEL_V20 | typeof MODEL_FLASH,
+  fps: number = DEFAULT_FRAME_RATE,
+  maxFrames: number = V20_MAX_FRAMES["720p"],
+): { min: number; max: number; options: number[] } {
+  if (model === MODEL_FLASH) {
+    const options: number[] = [];
+    for (let s = FLASH_SECONDS_MIN; s <= FLASH_SECONDS_MAX; s += 1) options.push(s);
+    return { min: FLASH_SECONDS_MIN, max: FLASH_SECONDS_MAX, options };
+  }
+  const options = allowedV20Durations(fps, maxFrames);
+  return {
+    min: options[0] ?? DEFAULT_DURATION_SEC,
+    max: options[options.length - 1] ?? DEFAULT_DURATION_SEC,
+    options,
+  };
+}
+
+/** Longest legal clip. Use per scene only when that beat needs it. */
+export function storyClipTargetSec(
+  model: typeof MODEL_V20 | typeof MODEL_FLASH,
+  fps: number = DEFAULT_FRAME_RATE,
+  maxFrames: number = V20_MAX_FRAMES["720p"],
+): number {
+  return storyTiming(model, fps, maxFrames).max;
+}
+
+/** Shortest legal clip. Longest is storyClipTargetSec — use that only when the beat needs it. */
+export function storyClipMinSec(
+  model: typeof MODEL_V20 | typeof MODEL_FLASH,
+  fps: number = DEFAULT_FRAME_RATE,
+  maxFrames: number = V20_MAX_FRAMES["720p"],
+): number {
+  return storyTiming(model, fps, maxFrames).min;
+}
+
+export function storySceneRange(
+  minutes: number,
+  model: typeof MODEL_V20 | typeof MODEL_FLASH,
+  fps: number = DEFAULT_FRAME_RATE,
+  maxFrames: number = V20_MAX_FRAMES["720p"],
+): { min: number; max: number } {
+  const budget = Math.min(STORY_MAX_TOTAL_SEC, clampStoryMinutes(minutes) * 60);
+  const long = storyClipTargetSec(model, fps, maxFrames);
+  const short = storyClipMinSec(model, fps, maxFrames);
+  const min = Math.min(STORY_SCENE_HARD_MAX, Math.max(STORY_SCENE_MIN, Math.ceil(budget / long)));
+  const max = Math.min(STORY_SCENE_HARD_MAX, Math.max(min, Math.ceil(budget / short)));
+  return { min, max };
+}
+
+export function clampStoryMinutes(value: number): number {
+  const n = Math.round(value);
+  if (!Number.isFinite(n)) return STORY_DEFAULT_MINUTES;
+  return Math.min(STORY_MINUTES_MAX, Math.max(STORY_MINUTES_MIN, n));
+}
+
+export function formatStoryLength(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m === 0) return `${r}s`;
+  if (r === 0) return `${m} min`;
+  return `${m} min ${r}s`;
 }
 
 export function formatTimingReadout(frames: number, fps: number): string {

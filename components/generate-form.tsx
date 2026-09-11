@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type Dispatch, type FormEvent, type SetStateAction } from "react";
 
+import { StoryWorkbench, type StoryWorkbenchHandle } from "@/components/story-workbench";
 import {
   allowedV20Durations,
   clampV20Duration,
@@ -669,6 +670,8 @@ export function GenerateForm() {
   const [keyMissing, setKeyMissing] = useState(false);
   const [agnesApiKey, setAgnesApiKey] = useState("");
   const [job, setJob] = useState<JobView>({ phase: "idle" });
+  const [benchMode, setBenchMode] = useState<"generate" | "story">("generate");
+  const storyRef = useRef<StoryWorkbenchHandle | null>(null);
 
   const pollAbort = useRef<AbortController | null>(null);
   const eventSource = useRef<EventSource | null>(null);
@@ -1337,6 +1340,29 @@ export function GenerateForm() {
     <div className="app">
       <header className="shell">
         <p className="brand">Agnes Video</p>
+        <fieldset className="seg" style={{ border: 0, margin: 0 }}>
+          <legend className="visually-hidden">Mode</legend>
+          <label>
+            <input
+              type="radio"
+              name="bench-mode"
+              value="generate"
+              checked={benchMode === "generate"}
+              onChange={() => setBenchMode("generate")}
+            />
+            <span>Generate</span>
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="bench-mode"
+              value="story"
+              checked={benchMode === "story"}
+              onChange={() => setBenchMode("story")}
+            />
+            <span>Story</span>
+          </label>
+        </fieldset>
         <div className="key-field">
           <label htmlFor="agnes-api-key">Agnes API key</label>
           <input
@@ -1373,15 +1399,29 @@ export function GenerateForm() {
               <span>Dark</span>
             </label>
           </fieldset>
-          <button type="button" className="btn btn-ghost" onClick={resetForm}>
-            Reset form
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={() => {
+              if (benchMode === "story") {
+                storyRef.current?.reset();
+                return;
+              }
+              resetForm();
+            }}
+          >
+            {benchMode === "story" ? "Reset story" : "Reset form"}
           </button>
         </div>
       </header>
 
       {keyMissing ? <p className="banner">{KEY_BANNER}</p> : null}
 
-      <div className="layout">
+      <div
+        className="layout"
+        style={benchMode === "generate" ? undefined : { display: "none" }}
+        aria-hidden={benchMode !== "generate"}
+      >
         <form className="request" onSubmit={onSubmit} noValidate>
           <h2 className="block">Model</h2>
           <fieldset className="group">
@@ -1958,6 +1998,14 @@ export function GenerateForm() {
           }}
         />
       </div>
+
+      <StoryWorkbench
+        ref={storyRef}
+        active={benchMode === "story"}
+        agnesApiKey={agnesApiKey}
+        onAuthError={() => setKeyMissing(true)}
+        onAuthOk={() => setKeyMissing(false)}
+      />
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import "server-only";
 
-import { MODEL_FLASH, MODEL_V20, UPSTREAM_TIMEOUT_MS } from "./constants";
+import { DEFAULT_IMAGE_MODEL, isImageModelId, UPSTREAM_TIMEOUT_MS, MODEL_FLASH, MODEL_V20 } from "./constants";
 import { getAgnesOrigin } from "./origin";
 import {
   isJobStatus,
@@ -11,6 +11,8 @@ import {
   type ModelId,
   type StatusSuccess,
 } from "./types";
+import { assertSafeHttpsUrl } from "@/lib/media/safe-download";
+import { isAgnesMediaRef, resolveAgnesMediaUrl } from "@/lib/media/store";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -128,9 +130,13 @@ async function parseJsonSafe(res: Response): Promise<unknown> {
   }
 }
 
-async function agnesFetch(path: string, init: RequestInit = {}): Promise<Response> {
+async function agnesFetch(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs: number = UPSTREAM_TIMEOUT_MS,
+): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const outer = init.signal;
   const onOuterAbort = () => controller.abort();
   outer?.addEventListener("abort", onOuterAbort, { once: true });
@@ -344,6 +350,200 @@ export async function parsePollResponse(
     };
   }
   return { ok: true, data };
+}
+
+const CHAT_TIMEOUT_MS = 90_000;
+const STORYBOARD_CHAT_MODEL = "agnes-2.5-flash";
+
+function shapeChatContent(parsed: unknown): string | null {
+  if (!isRecord(parsed)) return null;
+  const choices = parsed.choices;
+  if (!Array.isArray(choices) || choices.length === 0) return null;
+  const first = choices[0];
+  if (!isRecord(first)) return null;
+  const message = first.message;
+  if (isRecord(message) && typeof message.content === "string") {
+    const content = message.content.trim();
+    return content.length > 0 ? content : null;
+  }
+  if (typeof first.text === "string") {
+    const text = first.text.trim();
+    return text.length > 0 ? text : null;
+  }
+  return null;
+}
+
+export async function chatCompletion(
+  messages: { role: "system" | "user" | "assistant"; content: string }[],
+  apiKey: string | null,
+  timeoutMs: number = CHAT_TIMEOUT_MS,
+): Promise<{ ok: true; content: string } | { ok: false; status: number; detail: string }> {
+  const key = apiKey;
+  if (!key) {
+    return { ok: false, status: 401, detail: missingKeyCopy() };
+  }
+
+  try {
+    const res = await agnesFetch(
+      "/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: STORYBOARD_CHAT_MODEL,
+          messages,
+        }),
+      },
+      timeoutMs,
+    );
+    const parsed = await parseJsonSafe(res);
+    if (!res.ok) {
+      const mapped = mapHttpStatus(res.status);
+      return {
+        ok: false,
+        status: mapped,
+        detail: humanizeDetail(extractDetail(parsed) ?? defaultErrorCopy(mapped)),
+      };
+    }
+    const content = shapeChatContent(parsed);
+    if (!content) {
+      return { ok: false, status: 502, detail: "Agnes is unavailable or the job was not found." };
+    }
+    return { ok: true, content };
+  } catch (err) {
+    if (
+      (err instanceof DOMException && err.name === "AbortError") ||
+      (err instanceof Error && err.name === "AbortError")
+    ) {
+      return { ok: false, status: 502, detail: "Agnes is unavailable or the job was not found." };
+    }
+    return { ok: false, status: 502, detail: "Agnes is unavailable or the job was not found." };
+  }
+}
+
+const IMAGE_TIMEOUT_MS = 90_000;
+
+async function resolveImageInputs(raw: string[]): Promise<string[] | { error: string }> {
+  const out: string[] = [];
+  for (const item of raw) {
+    const text = item.trim();
+    if (!text) continue;
+    if (text.startsWith("data:")) {
+      return { error: "Sample image must be a stored file or a public https:// URL." };
+    }
+    if (isAgnesMediaRef(text)) {
+      try {
+        out.push(await resolveAgnesMediaUrl(text));
+      } catch {
+        return { error: "Sample image is gone. Upload it again." };
+      }
+      continue;
+    }
+    if (isPublicHttpsUrl(text)) {
+      out.push(text);
+      continue;
+    }
+    return { error: "Sample image must be a stored file or a public https:// URL." };
+  }
+  return out;
+}
+
+function shapeImageB64(parsed: unknown): { mime: string; b64: string } | { url: string } | null {
+  if (!isRecord(parsed)) return null;
+  const data = parsed.data;
+  const first = Array.isArray(data) ? data[0] : null;
+  if (!isRecord(first)) return null;
+  const b64 = typeof first.b64_json === "string" ? first.b64_json.trim() : "";
+  if (b64) {
+    const raw = b64.includes(",") ? b64.slice(b64.indexOf(",") + 1) : b64;
+    return { mime: "image/png", b64: raw };
+  }
+  const url = typeof first.url === "string" ? first.url.trim() : "";
+  if (url.startsWith("https://")) return { url };
+  return null;
+}
+
+export async function generateImagePng(
+  prompt: string,
+  apiKey: string | null,
+  opts?: { ratio?: string; model?: string; images?: string[] },
+): Promise<
+  | { ok: true; bytes: Buffer; contentType: string }
+  | { ok: false; status: number; detail: string }
+> {
+  const key = apiKey;
+  if (!key) {
+    return { ok: false, status: 401, detail: missingKeyCopy() };
+  }
+  const ratio = opts?.ratio?.trim() || "1:1";
+  const model = isImageModelId(opts?.model) ? opts.model : DEFAULT_IMAGE_MODEL;
+  const extraBody: Record<string, unknown> = { response_format: "b64_json" };
+  if (opts?.images && opts.images.length > 0) {
+    const resolved = await resolveImageInputs(opts.images);
+    if ("error" in resolved) {
+      return { ok: false, status: 400, detail: resolved.error };
+    }
+    if (resolved.length > 0) extraBody.image = resolved;
+  }
+  try {
+    const res = await agnesFetch(
+      "/v1/images/generations",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          prompt,
+          size: "1K",
+          ratio,
+          return_base64: extraBody.image ? undefined : true,
+          extra_body: extraBody,
+        }),
+      },
+      IMAGE_TIMEOUT_MS,
+    );
+    const parsed = await parseJsonSafe(res);
+    if (!res.ok) {
+      const mapped = mapHttpStatus(res.status);
+      return {
+        ok: false,
+        status: mapped,
+        detail: humanizeDetail(extractDetail(parsed) ?? defaultErrorCopy(mapped)),
+      };
+    }
+    const shaped = shapeImageB64(parsed);
+    if (!shaped) {
+      return { ok: false, status: 502, detail: "Character sheet did not return an image." };
+    }
+    if ("b64" in shaped) {
+      return {
+        ok: true,
+        bytes: Buffer.from(shaped.b64, "base64"),
+        contentType: shaped.mime,
+      };
+    }
+    await assertSafeHttpsUrl(shaped.url);
+    const dl = await fetch(shaped.url, { cache: "no-store", redirect: "error" });
+    if (!dl.ok) {
+      return { ok: false, status: 502, detail: "Could not download the character sheet." };
+    }
+    const buf = Buffer.from(await dl.arrayBuffer());
+    return { ok: true, bytes: buf, contentType: "image/png" };
+  } catch (err) {
+    if (
+      (err instanceof DOMException && err.name === "AbortError") ||
+      (err instanceof Error && err.name === "AbortError")
+    ) {
+      return { ok: false, status: 502, detail: "Character sheet timed out." };
+    }
+    return { ok: false, status: 502, detail: "Could not generate the character sheet." };
+  }
 }
 
 export function parseStatusQuery(

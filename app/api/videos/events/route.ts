@@ -1,4 +1,4 @@
-import { agnesPollDelayMs, POLL_CAP_MS } from "@/lib/agnes/constants";
+import { agnesPollDelayMs, POLL_CAP_MS, storyPollDelayMs } from "@/lib/agnes/constants";
 import { pollAgnesKey } from "@/lib/agnes/api-key";
 import type { JobStatus } from "@/lib/agnes/types";
 import { parseStatusQuery, parsePollResponse, pollVideo } from "@/lib/agnes/upstream";
@@ -65,6 +65,9 @@ export async function GET(request: Request): Promise<Response> {
   }
 
   const { videoId, modelName } = parsed;
+  const storyPace = url.searchParams.get("pace") === "story";
+  const pollDelay = (elapsedMs: number, pollIndex: number): number =>
+    storyPace ? storyPollDelayMs(elapsedMs) : agnesPollDelayMs(pollIndex);
   const ac = new AbortController();
   const onClientAbort = () => ac.abort();
   request.signal.addEventListener("abort", onClientAbort);
@@ -80,7 +83,7 @@ export async function GET(request: Request): Promise<Response> {
         controller.enqueue(new TextEncoder().encode(": ok\n\n"));
         const startedAt = Date.now();
         let pollIndex = 0;
-        let delay = agnesPollDelayMs(0);
+        let delay = pollDelay(0, 0);
         let rateFails = 0;
         let netFails = 0;
         let lastStatus: JobStatus | undefined;
@@ -126,13 +129,13 @@ export async function GET(request: Request): Promise<Response> {
             if (result.data.progress !== undefined) payload.progress = result.data.progress;
             emit("status", payload);
             pollIndex += 1;
-            delay = agnesPollDelayMs(pollIndex);
+            delay = pollDelay(Date.now() - startedAt, pollIndex);
             continue;
           }
 
           if (result.status === 429) {
             rateFails += 1;
-            delay = agnesPollDelayMs(pollIndex) + backoffMs(rateFails);
+            delay = pollDelay(Date.now() - startedAt, pollIndex) + backoffMs(rateFails);
             continue;
           }
 
