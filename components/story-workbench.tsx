@@ -52,7 +52,7 @@ import {
   type V20Fps,
   type V20Resolution,
 } from "@/lib/agnes/constants";
-import { FLASH_STORY_NEGATIVE_LINE, formatStoryShot, isComposedShotPrompt, applyShotDurationLine, sceneBridgeStillPrompt, sceneTimeRange } from "@/lib/agnes/story-format";
+import { FLASH_STORY_NEGATIVE_LINE, formatStoryShot, isComposedShotPrompt, isComposedStillPrompt, applyShotDurationLine, sceneBridgeStillPrompt, sceneTimeRange } from "@/lib/agnes/story-format";
 import {
   isJobStatus,
   isPublicHttpsUrl,
@@ -85,6 +85,7 @@ type SceneDraft = {
   style: string;
   dialogue: string;
   videoPrompt: string;
+  stillPrompt: string;
   bridgeId: string;
   bridgeUrl: string;
 };
@@ -457,8 +458,9 @@ function shotReady(scene: SceneDraft): boolean {
 }
 
 function mediaPreview(id: string, url: string): string {
-  if (id) return `/api/media/${id}`;
+  if (isPublicHttpsUrl(url)) return url;
   if (url.startsWith("agnes-media:")) return `/api/media/${url.slice("agnes-media:".length)}`;
+  if (id) return `/api/media/${id}`;
   return url;
 }
 
@@ -709,6 +711,20 @@ function ZoomableImage({
   );
 }
 
+function composeStillPrompt(
+  scene: SceneDraft,
+  characters: CharacterDraft[],
+  filmStyle: string,
+  story: string,
+): string {
+  const custom = scene.stillPrompt.trim();
+  if (custom && isComposedStillPrompt(custom)) return custom;
+  const locks = sceneCastForStill(scene, characters);
+  const base = sceneBridgeStillPrompt(scene, locks, filmStyle, story);
+  if (custom) return `${base} Director note: ${custom}`;
+  return base;
+}
+
 function sceneCastLocks(scene: SceneDraft, roster: CharacterDraft[]): { name: string; appearance: string }[] {
   const wanted = ((scene.cast ?? []).length > 0 ? scene.cast : roster.map((c) => c.name)).map((n) =>
     n.toLowerCase(),
@@ -716,6 +732,48 @@ function sceneCastLocks(scene: SceneDraft, roster: CharacterDraft[]): { name: st
   const present = roster.filter((c) => c.stillUrl && wanted.includes(c.name.toLowerCase()));
   const used = present.length > 0 ? present : roster.filter((c) => c.stillUrl);
   return used.map((c) => ({ name: c.name, appearance: c.appearance }));
+}
+
+function sceneCastForStill(scene: SceneDraft, roster: CharacterDraft[]): { name: string; appearance: string }[] {
+  const locks = sceneCastLocks(scene, roster);
+  if (locks.length > 0) return locks;
+  const wanted = ((scene.cast ?? []).length > 0 ? scene.cast : roster.map((c) => c.name)).map((n) =>
+    n.toLowerCase(),
+  );
+  const used = roster.filter((c) => wanted.includes(c.name.toLowerCase()));
+  return (used.length > 0 ? used : roster).map((c) => ({ name: c.name, appearance: c.appearance }));
+}
+
+function stillJudgeSource(scene: SceneDraft): string {
+  if (isPublicHttpsUrl(scene.bridgeUrl)) return scene.bridgeUrl;
+  if (scene.bridgeUrl.startsWith("agnes-media:")) return scene.bridgeUrl;
+  if (scene.bridgeId) return `agnes-media:${scene.bridgeId}`;
+  return scene.bridgeUrl;
+}
+
+function stillFailCopy(reasons: string[]): string {
+  const text = reasons.map((r) => r.trim()).filter(Boolean).join(" ");
+  if (/could not judge/i.test(text)) {
+    return "Could not judge this still. The picture is kept. Try Check & fix stills or regenerate.";
+  }
+  return text
+    ? `Gold standard failed after retries: ${text} Edit the still prompt and regenerate.`
+    : "Gold standard failed after retries. Edit the still prompt and regenerate.";
+}
+
+function parseStillCheck(body: unknown): { pass: boolean; reasons: string[]; judged: boolean } | null {
+  if (typeof body !== "object" || body === null) return null;
+  const rec = body as Record<string, unknown>;
+  const raw = rec.check && typeof rec.check === "object" ? (rec.check as Record<string, unknown>) : rec;
+  if (typeof raw.pass !== "boolean") return null;
+  const reasons: string[] = [];
+  if (Array.isArray(raw.reasons)) {
+    for (const item of raw.reasons) {
+      if (typeof item === "string" && item.trim()) reasons.push(item.trim());
+    }
+  }
+  const judged = raw.judged === true;
+  return { pass: raw.pass, reasons, judged };
 }
 
 function composeSceneVideoPrompt(index: number, scenes: SceneDraft[], characters: CharacterDraft[]): string {
@@ -862,19 +920,25 @@ function SceneBeatPair({
   scene,
   scenes,
   characters,
+  filmStyle,
+  story,
   stillBusy,
   endError,
   onZoom,
   onRegenEnd,
+  onStillPrompt,
 }: {
   index: number;
   scene: SceneDraft;
   scenes: SceneDraft[];
   characters: CharacterDraft[];
+  filmStyle: string;
+  story: string;
   stillBusy: boolean;
   endError?: string;
   onZoom: (src: string, alt: string) => void;
   onRegenEnd: (index: number) => void;
+  onStillPrompt: (index: number, value: string) => void;
 }) {
   const wanted = (scene.cast ?? []).map((n) => n.toLowerCase());
   const castSheets = (wanted.length > 0
@@ -933,6 +997,20 @@ function SceneBeatPair({
         )}
         {endError ? <p className="form-error">{endError}</p> : null}
         <p className="hint">{hasNext ? `Start of scene ${nextIndex}` : "Last still of this clip"}</p>
+        <label className="field" htmlFor={`scene-still-prompt-${index}`}>
+          End still prompt
+        </label>
+        <textarea
+          id={`scene-still-prompt-${index}`}
+          className="prompt-clip"
+          rows={6}
+          value={composeStillPrompt(scene, characters, filmStyle, story)}
+          onChange={(e) => onStillPrompt(index, e.target.value)}
+        />
+        <p className="hint">
+          Gold standard: one live movie frame, each named character once, no spritesheet or duplicates. Failed stills
+          redraw automatically.
+        </p>
         <button
           type="button"
           className="btn btn-ghost"
@@ -1426,6 +1504,7 @@ export const StoryWorkbench = forwardRef<
         bridgeId: typeof s.bridgeId === "string" ? s.bridgeId : "",
         bridgeUrl: typeof s.bridgeUrl === "string" ? s.bridgeUrl : "",
         videoPrompt: typeof s.videoPrompt === "string" ? s.videoPrompt : "",
+        stillPrompt: typeof s.stillPrompt === "string" ? s.stillPrompt : "",
       }));
       setScenes(nextScenes);
       const restored: Clip[] = nextScenes.map((_, i) => {
@@ -1923,6 +2002,7 @@ export const StoryWorkbench = forwardRef<
           style: str("style"),
           dialogue: str("dialogue") || "None.",
           videoPrompt: "",
+          stillPrompt: "",
           bridgeId: "",
           bridgeUrl: "",
         });
@@ -2103,7 +2183,9 @@ export const StoryWorkbench = forwardRef<
     });
   }
 
-  async function extractFrame(url: string): Promise<{ ok: true; id: string } | { ok: false; detail: string }> {
+  async function extractFrame(
+    url: string,
+  ): Promise<{ ok: true; id: string; url: string } | { ok: false; detail: string }> {
     try {
       const res = await fetch("/api/videos/frame", {
         method: "POST",
@@ -2113,15 +2195,11 @@ export const StoryWorkbench = forwardRef<
       });
       if (!res.ok) return { ok: false, detail: await readDetail(res) };
       const body: unknown = await res.json();
-      const id =
-        typeof body === "object" &&
-        body !== null &&
-        "id" in body &&
-        typeof (body as { id: unknown }).id === "string"
-          ? (body as { id: string }).id
-          : "";
+      const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : null;
+      const id = rec && typeof rec.id === "string" ? rec.id : "";
+      const urlOut = rec && typeof rec.url === "string" ? rec.url : "";
       if (!id) return { ok: false, detail: "Could not extract the last frame." };
-      return { ok: true, id };
+      return { ok: true, id, url: urlOut };
     } catch {
       return { ok: false, detail: "Could not extract the last frame." };
     }
@@ -2142,7 +2220,7 @@ export const StoryWorkbench = forwardRef<
       progress: undefined,
       error: undefined,
       lastFrameId: frame.ok ? frame.id : undefined,
-      lastFrameSrc: frame.ok ? `/api/media/${frame.id}` : undefined,
+      lastFrameSrc: frame.ok ? mediaPreview(frame.id, frame.url) : undefined,
     });
     return "ok";
   }
@@ -2173,11 +2251,15 @@ export const StoryWorkbench = forwardRef<
     });
   }
 
-  async function ensureBridge(index: number, signal?: AbortSignal): Promise<string | null> {
+  async function ensureBridge(
+    index: number,
+    signal?: AbortSignal,
+    opts?: { replace?: boolean },
+  ): Promise<string | null> {
     const existing = scenesRef.current[index];
     if (!existing) return null;
-    if (existing.bridgeUrl) return existing.bridgeUrl;
-    const waiting = bridgeWaitRef.current.get(index);
+    if (!opts?.replace && existing.bridgeUrl) return existing.bridgeUrl;
+    const waiting = !opts?.replace ? bridgeWaitRef.current.get(index) : undefined;
     if (waiting) return waiting;
     const epoch = bridgeEpochRef.current;
     const gen = bridgeGenRef.current.get(index) ?? 0;
@@ -2186,20 +2268,13 @@ export const StoryWorkbench = forwardRef<
         const scene = scenesRef.current[index];
         if (!scene) return null;
         const roster = charactersRef.current;
-        const wanted = ((scene.cast ?? []).length > 0 ? scene.cast : roster.map((c) => c.name)).map((n) =>
-          n.toLowerCase(),
-        );
-        const used = roster.filter((c) => wanted.includes(c.name.toLowerCase()));
-        const prompt = sceneBridgeStillPrompt(
-          scene,
-          (used.length > 0 ? used : roster).map((c) => ({ name: c.name, appearance: c.appearance })),
-          filmStyleRef.current,
-          storyRef.current,
-        );
+        const prompt = composeStillPrompt(scene, roster, filmStyleRef.current, storyRef.current);
         const payload: Record<string, unknown> = {
           prompt,
           ratio: modelRef.current === MODEL_FLASH ? filmRef.current.flashAspect : filmRef.current.v20Aspect,
           model: imageModelRef.current,
+          cast: sceneCastForStill(scene, roster).map((c) => c.name),
+          validate: true,
         };
         const typedKey = keyRef.current.trim();
         if (typedKey) payload.agnes_api_key = typedKey;
@@ -2232,7 +2307,14 @@ export const StoryWorkbench = forwardRef<
         }
         if (bridgeEpochRef.current !== epoch) return null;
         if ((bridgeGenRef.current.get(index) ?? 0) !== gen) return null;
-        setStillErrorAt(index, null);
+        const check = parseStillCheck(body);
+        if (!check) {
+          setStillErrorAt(index, "Could not judge this still. The picture is kept. Try Check & fix stills.");
+        } else if (!check.pass) {
+          setStillErrorAt(index, stillFailCopy(check.reasons));
+        } else {
+          setStillErrorAt(index, null);
+        }
         patchScene(index, { bridgeId: id, bridgeUrl: url });
         return url;
       } catch {
@@ -2270,14 +2352,79 @@ export const StoryWorkbench = forwardRef<
   async function regenSceneStill(index: number) {
     bridgeWaitRef.current.delete(index);
     bridgeGenRef.current.set(index, (bridgeGenRef.current.get(index) ?? 0) + 1);
-    patchScene(index, { bridgeId: "", bridgeUrl: "" });
     setStillErrorAt(index, null);
     setStillBusy(true);
     setStillNote(`Drawing end still for scene ${index + 1}…`);
     try {
-      await ensureBridge(index);
+      await ensureBridge(index, undefined, { replace: true });
     } catch {
       setStillErrorAt(index, "Could not draw this end still.");
+    } finally {
+      setStillBusy(false);
+      setStillNote("");
+    }
+  }
+
+  async function checkAndFixStills() {
+    const list = scenesRef.current;
+    const targets = list
+      .map((scene, index) => ({ scene, index }))
+      .filter(({ scene }) => Boolean(stillJudgeSource(scene)));
+    if (targets.length === 0) {
+      setStillNote("No scene stills to check yet.");
+      return;
+    }
+    setStillBusy(true);
+    setStillNote(`Checking ${targets.length} scene stills…`);
+    try {
+      for (const { scene, index } of targets) {
+        const latest = scenesRef.current[index] ?? scene;
+        const image = stillJudgeSource(latest);
+        if (!image) continue;
+        setStillNote(`Checking scene ${index + 1} still…`);
+        const payload: Record<string, unknown> = {
+          check_only: true,
+          image,
+          cast: sceneCastForStill(latest, charactersRef.current).map((c) => c.name),
+        };
+        const typedKey = keyRef.current.trim();
+        if (typedKey) payload.agnes_api_key = typedKey;
+        const res = await fetch("/api/scene-still", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (res.status === 401) {
+          onAuthError();
+          setStillErrorAt(index, await readDetail(res));
+          continue;
+        }
+        if (!res.ok) {
+          setStillErrorAt(index, await readDetail(res));
+          continue;
+        }
+        onAuthOk();
+        const verdict = parseStillCheck(await res.json());
+        if (!verdict) {
+          setStillErrorAt(index, "Could not judge this still. The picture is kept. Try again.");
+          continue;
+        }
+        if (verdict.pass) {
+          setStillErrorAt(index, null);
+          continue;
+        }
+        if (!verdict.judged) {
+          setStillErrorAt(index, stillFailCopy(verdict.reasons));
+          continue;
+        }
+        setStillNote(`Scene ${index + 1} failed gold standard — redrawing…`);
+        bridgeWaitRef.current.delete(index);
+        bridgeGenRef.current.set(index, (bridgeGenRef.current.get(index) ?? 0) + 1);
+        await ensureBridge(index, undefined, { replace: true });
+      }
+    } catch {
+      setStillNote("Could not finish checking stills.");
     } finally {
       setStillBusy(false);
       setStillNote("");
@@ -2629,6 +2776,7 @@ export const StoryWorkbench = forwardRef<
   );
 
   function queueLive(): string {
+    if (stillBusy || stillNote) return stillNote || "Working on scene stills…";
     if (merging) return `Merging ${clips.length} clips…`;
     if (mergedUrl) return "Merged.";
     const generating = clips
@@ -2658,7 +2806,7 @@ export const StoryWorkbench = forwardRef<
       <Pipeline current={current} onBack={gate === "input" ? null : goBack} />
 
       {gate === "input" ? (
-        <div className="layout">
+        <div className="layout layout-input">
           <form className="request" onSubmit={onWriteSubmit} noValidate>
             <h2 className="block">Source</h2>
             <fieldset className="seg" style={{ border: 0, margin: "0 0 0.9rem" }}>
@@ -2761,6 +2909,7 @@ export const StoryWorkbench = forwardRef<
               <button type="submit" className="btn btn-primary" disabled={writing || assetStoring}>
                 {writing ? "Writing…" : "Write storyboard"}
               </button>
+              {writeError ? <p className="form-error">{writeError}</p> : null}
               <p className="hint">No Agnes create yet.</p>
             </div>
           </form>
@@ -2993,6 +3142,14 @@ export const StoryWorkbench = forwardRef<
                 <button type="button" className="btn btn-ghost" onClick={() => setOpenScenes(new Set())}>
                   Collapse all
                 </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={stillBusy || writing || sheetBusy || !scenes.some((s) => s.bridgeUrl || s.bridgeId)}
+                  onClick={() => void checkAndFixStills()}
+                >
+                  Check &amp; fix stills
+                </button>
               </div>
             </div>
             {scenes.map((scene, index) => {
@@ -3023,10 +3180,13 @@ export const StoryWorkbench = forwardRef<
                     scene={scene}
                     scenes={scenes}
                     characters={characters}
+                    filmStyle={filmStyle}
+                    story={story}
                     stillBusy={stillBusy}
                     endError={stillErrors[index]}
                     onZoom={openZoom}
                     onRegenEnd={(i) => void regenSceneStill(i)}
+                    onStillPrompt={(i, value) => patchScene(i, { stillPrompt: value })}
                   />
                   <details
                     className="scene-fold"
@@ -3212,6 +3372,7 @@ export const StoryWorkbench = forwardRef<
                   writing ||
                   sheetBusy ||
                   assetStoring ||
+                  stillBusy ||
                   characters.length === 0 ||
                   characters.some((c) => !c.stillUrl) ||
                   scenes.some((s) => !shotReady(s))
@@ -3220,10 +3381,19 @@ export const StoryWorkbench = forwardRef<
               >
                 Looks good — generate clips
               </button>
+              <button
+                type="button"
+                className="btn dock-secondary"
+                disabled={stillBusy || writing || sheetBusy || !scenes.some((s) => s.bridgeUrl || s.bridgeId)}
+                onClick={() => void checkAndFixStills()}
+              >
+                Check &amp; fix stills
+              </button>
               <p className="hint">
                 Scene 1 from character images. Later scenes: landing still of N → start of N+1. Next create
                 ~65s after the previous POST even if that clip is still generating. Same seed. Max beat{" "}
-                {planMaxSec}s. Total about {formatStoryLength(totalSec)}.
+                {planMaxSec}s. Total about {formatStoryLength(totalSec)}. Check &amp; fix judges each landing
+                still — spritesheet or clone fails get redrawn (free images).
               </p>
             </div>
           </aside>
@@ -3233,7 +3403,7 @@ export const StoryWorkbench = forwardRef<
       {gate === "clips" ? (
         <>
           <div className="story-queue job-well" aria-live="polite" aria-atomic="true">
-            {generatingIndex >= 0 || merging ? (
+            {generatingIndex >= 0 || merging || stillBusy ? (
               <div className="job-run">
                 <span className="spin" aria-hidden="true" />
                 <p className="job-line sr-status">{queueLive()}</p>
@@ -3241,7 +3411,7 @@ export const StoryWorkbench = forwardRef<
             ) : (
               <p className="sr-status">{queueLive()}</p>
             )}
-            {failedIndex >= 0 && generatingIndex < 0 && !merging && !mergedUrl ? (
+            {failedIndex >= 0 && generatingIndex < 0 && !merging && !mergedUrl && !stillBusy ? (
               <div className="story-queue-actions">
                 <button
                   type="button"
@@ -3252,8 +3422,22 @@ export const StoryWorkbench = forwardRef<
                 </button>
               </div>
             ) : null}
+            <div className="story-queue-actions">
+              <button
+                type="button"
+                className="btn"
+                disabled={stillBusy || merging || !scenes.some((s) => s.bridgeUrl || s.bridgeId)}
+                onClick={() => void checkAndFixStills()}
+              >
+                Check &amp; fix stills
+              </button>
+            </div>
             {!mergedUrl ? (
-              <p className="hint">Free accounts: about one create every 65s. Earlier clips can keep generating.{queueNote ? ` ${queueNote}` : ""}</p>
+              <p className="hint">
+                Free accounts: about one create every 65s. Earlier clips can keep generating.
+                {queueNote ? ` ${queueNote}` : ""} Check &amp; fix judges landing stills (spritesheet / clones)
+                and redraws fails.
+              </p>
             ) : null}
           </div>
 
@@ -3280,10 +3464,13 @@ export const StoryWorkbench = forwardRef<
                       scene={scene}
                       scenes={scenes}
                       characters={characters}
+                      filmStyle={filmStyle}
+                      story={story}
                       stillBusy={stillBusy}
                       endError={stillErrors[index]}
                       onZoom={openZoom}
                       onRegenEnd={(i) => void regenSceneStill(i)}
+                      onStillPrompt={(i, value) => patchScene(i, { stillPrompt: value })}
                     />
                   ) : null}
                   <div className="clip-row">
@@ -3401,47 +3588,45 @@ export const StoryWorkbench = forwardRef<
               );
             })}
 
-            <div className="merge-bar">
-              {mergedUrl ? (
-                <>
-                  <video
-                    ref={mergedPlayerRef}
-                    className="player"
-                    src={mergedUrl}
-                    controls
-                    playsInline
-                    tabIndex={-1}
+            {mergedUrl ? (
+              <div className="merge-result">
+                <video
+                  ref={mergedPlayerRef}
+                  className="player"
+                  src={mergedUrl}
+                  controls
+                  playsInline
+                  tabIndex={-1}
+                />
+                <p>
+                  <a href={mergedUrl} download target="_blank" rel="noopener noreferrer">
+                    Download MP4
+                  </a>
+                </p>
+              </div>
+            ) : (
+              <div className="merge-bar">
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={mergeChecked}
+                    disabled={!allReady || merging}
+                    onChange={(e) => setMergeChecked(e.target.checked)}
                   />
-                  <p>
-                    <a href={mergedUrl} download target="_blank" rel="noopener noreferrer">
-                      Download MP4
-                    </a>
-                  </p>
-                </>
-              ) : (
-                <>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={mergeChecked}
-                      disabled={!allReady || merging}
-                      onChange={(e) => setMergeChecked(e.target.checked)}
-                    />
-                    <span>These clips are correct</span>
-                  </label>
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={!allReady || !mergeChecked || merging}
-                    onClick={() => void mergeClips()}
-                  >
-                    {merging ? "Merging…" : "Merge clips"}
-                  </button>
-                  <p className="hint">No speech, no captions. Concat only.</p>
-                  {mergeError ? <p className="form-error">{mergeError}</p> : null}
-                </>
-              )}
-            </div>
+                  <span>These clips are correct</span>
+                </label>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={!allReady || !mergeChecked || merging}
+                  onClick={() => void mergeClips()}
+                >
+                  {merging ? "Merging…" : "Merge clips"}
+                </button>
+                <p className="hint">No speech, no captions. Concat only.</p>
+                {mergeError ? <p className="form-error">{mergeError}</p> : null}
+              </div>
+            )}
           </div>
         </>
       ) : null}

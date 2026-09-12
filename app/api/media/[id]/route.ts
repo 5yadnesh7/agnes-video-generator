@@ -9,6 +9,9 @@ export async function GET(
   if (!stored) {
     return Response.json({ detail: "Not found." }, { status: 404 });
   }
+  if (stored.publicUrl) {
+    return Response.redirect(stored.publicUrl, 302);
+  }
 
   return new Response(new Uint8Array(stored.bytes), {
     headers: {

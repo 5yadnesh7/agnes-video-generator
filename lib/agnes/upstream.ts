@@ -373,8 +373,17 @@ function shapeChatContent(parsed: unknown): string | null {
   return null;
 }
 
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
+export type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string | ChatContentPart[];
+};
+
 export async function chatCompletion(
-  messages: { role: "system" | "user" | "assistant"; content: string }[],
+  messages: ChatMessage[],
   apiKey: string | null,
   timeoutMs: number = CHAT_TIMEOUT_MS,
 ): Promise<{ ok: true; content: string } | { ok: false; status: number; detail: string }> {

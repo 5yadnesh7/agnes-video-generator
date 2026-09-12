@@ -120,15 +120,20 @@ export function sceneBridgeStillPrompt(
     .map((c) => `${c.name.trim()}${c.appearance.trim() ? `: ${c.appearance.trim()}` : ""}`)
     .filter((line) => line.trim())
     .join(". ");
+  const names = characters.map((c) => c.name.trim()).filter(Boolean);
   const brief = clipStoryBrief(storyBrief ?? "");
   const tone = filmStyle.trim() || scene.style.trim();
   return [
-    "One cinematic last-frame still for this film. A single live shot, not a spritesheet, not a collage, not comic panels, not a storyboard grid.",
-    "Match this story's genre, audience, and tone. Do not make it a children's film unless the story is for children.",
-    brief ? `Story (follow this world and tone): ${brief}` : "",
+    "One cinematic last-frame still for this film. A single live camera shot from a finished movie beat.",
+    "Rules: one frame only. Not a spritesheet, character model sheet, turnaround, pose grid, collage, comic panel, storyboard, split screen, or bible page.",
+    "Each named character appears exactly once. No duplicate of the same named character.",
+    "No printed names, captions, color palettes, or reference-board chrome.",
+    "Follow this story's genre, audience, medium, and tone only. Do not substitute a different genre.",
+    brief ? `Story (world and tone to follow): ${brief}` : "",
     "This is where the scene LANDS — the final pose and framing after the action.",
     `Setting: ${scene.setting.trim()}`,
     `Who is on screen: ${scene.subject.trim()}`,
+    names.length > 0 ? `Named cast (each once): ${names.join(", ")}` : "",
     `Action that has just finished: ${scene.action.trim()}`,
     scene.camera_movement.trim() ? `Camera: ${scene.camera_movement.trim()}` : "",
     scene.lighting.trim() ? `Lighting: ${scene.lighting.trim()}` : "",
@@ -138,6 +143,59 @@ export function sceneBridgeStillPrompt(
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+export const SCENE_STILL_RETRY_TAIL =
+  "Previous frame failed the still rules. Draw one live movie still only. Each named character once. No duplicates, spritesheet, turnaround, collage, labels, or grid.";
+
+export const SCENE_STILL_MAX_ATTEMPTS = 3;
+
+export function isComposedStillPrompt(text: string): boolean {
+  return text.trim().startsWith("One cinematic last-frame still");
+}
+
+export function sceneStillJudgeSystem(): string {
+  return `You are a strict stills QC judge for a film pipeline. Reply with one JSON object only. No markdown.
+Schema: { "pass": boolean, "reasons": string[] }
+FAIL (pass=false) if ANY rule is broken:
+- more than one frame in the image (spritesheet, model sheet, bible, turnaround, pose grid, collage, comic panels, storyboard, split screen)
+- printed name labels, captions, color palette swatches, reference-board chrome
+- the same named character appears more than once
+- a named character from the provided cast is missing
+- extra unnamed foreground people who are not extras in the far background
+PASS (pass=true) only if it is one live cinematic movie frame and each named character in the provided cast appears exactly once. Distinct named characters in the same frame is allowed.
+reasons: short English phrases, empty if pass.`;
+}
+
+export function parseStillVerdict(content: string): { pass: boolean; reasons: string[] } {
+  let text = content.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) text = fenced[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      const rec = JSON.parse(text.slice(start, end + 1)) as unknown;
+      if (typeof rec === "object" && rec !== null) {
+        const pass = (rec as { pass?: unknown }).pass === true;
+        const raw = (rec as { reasons?: unknown }).reasons;
+        const reasons: string[] = [];
+        if (Array.isArray(raw)) {
+          for (const item of raw) {
+            if (typeof item === "string" && item.trim()) reasons.push(item.trim());
+          }
+        }
+        return { pass, reasons };
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+  const lower = text.toLowerCase();
+  if (lower.includes('"pass": true') || lower.includes('"pass":true')) {
+    return { pass: true, reasons: [] };
+  }
+  return { pass: false, reasons: [text.slice(0, 180) || "Failed gold standard."] };
 }
 
 export const FLASH_STORY_NEGATIVE_LINE =

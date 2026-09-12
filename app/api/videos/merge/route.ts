@@ -82,8 +82,8 @@ export async function POST(request: Request): Promise<Response> {
       }
 
       const mp4 = await readFile(outputPath);
-      const id = await saveUpload(new Uint8Array(mp4), "video/mp4", "merged.mp4");
-      return Response.json({ id, url: `/api/media/${id}` });
+      const stored = await saveUpload(new Uint8Array(mp4), "video/mp4", "merged.mp4");
+      return Response.json({ id: stored.id, url: stored.url.startsWith("agnes-media:") ? `/api/media/${stored.id}` : stored.url });
     });
   } catch {
     return jsonError(502, "Could not merge these clips.");

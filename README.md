@@ -15,3 +15,5 @@ npm run dev
 Open http://localhost:3000
 
 File uploads need `PUBLIC_APP_URL` set to a public `https://` origin (a tunnel or deployed host). Agnes fetches that origin; `localhost` is not reachable from Agnes. Paste a public URL still works without it.
+
+On Vercel, connect a **Blob** store to the project (Storage → Blob). Serverless `/tmp` is not shared across requests, so `/api/media/...` 404s without Blob. The Blob integration sets `BLOB_READ_WRITE_TOKEN`.

@@ -3,6 +3,8 @@ import "server-only";
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { del, get, list, put } from "@vercel/blob";
+
 import { isPublicHttpsUrl } from "@/lib/agnes/types";
 
 export const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
@@ -41,7 +43,27 @@ const EXT_MIME: Record<string, string> = {
   aac: "audio/aac",
 };
 
-type Meta = { contentType: string; filename: string };
+type Meta = { contentType: string; filename: string; url?: string };
+
+export type StoredUpload = { id: string; url: string };
+
+function blobToken(): string | undefined {
+  const t = process.env.BLOB_READ_WRITE_TOKEN?.trim();
+  return t || undefined;
+}
+
+function useBlobStore(): boolean {
+  return Boolean(blobToken()) || Boolean(process.env.VERCEL);
+}
+
+function blobPath(id: string): string {
+  return `agnes/${id}`;
+}
+
+function blobOpts(): { token?: string } {
+  const token = blobToken();
+  return token ? { token } : {};
+}
 
 function uploadsDir(): string {
   if (process.env.VERCEL) {
@@ -88,6 +110,10 @@ export async function purgeExpiredUploads(): Promise<void> {
 }
 
 async function runPurge(): Promise<void> {
+  if (useBlobStore()) {
+    await runPurgeBlob();
+    return;
+  }
   const dir = uploadsDir();
   let names: string[];
   try {
@@ -123,6 +149,20 @@ async function runPurge(): Promise<void> {
       await unlink(metaPath).catch(() => undefined);
     }),
   );
+}
+
+async function runPurgeBlob(): Promise<void> {
+  const cutoff = Date.now() - UPLOAD_TTL_MS;
+  let cursor: string | undefined;
+  const opts = blobOpts();
+  do {
+    const page = await list({ prefix: "agnes/", cursor, limit: 100, ...opts });
+    const stale = page.blobs
+      .filter((b) => new Date(b.uploadedAt).getTime() < cutoff)
+      .map((b) => b.url);
+    if (stale.length > 0) await del(stale, opts);
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
 }
 
 function resolveUploadPath(id: string): string | null {
@@ -187,9 +227,23 @@ export async function saveUpload(
   bytes: Uint8Array,
   contentType: string,
   filename: string,
-): Promise<string> {
+): Promise<StoredUpload> {
   await purgeExpiredUploads();
   const id = crypto.randomUUID();
+  if (useBlobStore()) {
+    try {
+      const blob = await put(blobPath(id), Buffer.from(bytes), {
+        access: "public",
+        addRandomSuffix: false,
+        contentType,
+        cacheControlMaxAge: Math.max(60, Math.floor(UPLOAD_TTL_MS / 1000)),
+        ...blobOpts(),
+      });
+      return { id, url: blob.url };
+    } catch {
+      throw new Error("Connect a Vercel Blob store so images persist in production.");
+    }
+  }
   const dir = uploadsDir();
   await mkdir(/* turbopackIgnore: true */ dir, { recursive: true });
   const filePath = resolveUploadPath(id);
@@ -204,7 +258,7 @@ export async function saveUpload(
     await unlink(metaPath).catch(() => undefined);
     throw err;
   }
-  return id;
+  return { id, url: `agnes-media:${id}` };
 }
 
 export function isAgnesMediaRef(value: string): boolean {
@@ -221,12 +275,16 @@ export async function resolveAgnesMediaUrl(ref: string): Promise<string> {
   if (!stored) {
     throw new Error("File is gone. Upload again.");
   }
+  if (stored.publicUrl && isPublicHttpsUrl(stored.publicUrl)) return stored.publicUrl;
   return `data:${stored.contentType};base64,${stored.bytes.toString("base64")}`;
 }
 
 export async function readUpload(
   id: string,
-): Promise<{ bytes: Buffer; contentType: string } | null> {
+): Promise<{ bytes: Buffer; contentType: string; publicUrl?: string } | null> {
+  if (useBlobStore()) {
+    return readBlob(id);
+  }
   await purgeExpiredUploads();
   const filePath = resolveUploadPath(id);
   if (!filePath) return null;
@@ -245,6 +303,24 @@ export async function readUpload(
       return null;
     }
     return { bytes, contentType: (parsed as Meta).contentType };
+  } catch {
+    return null;
+  }
+}
+
+async function readBlob(
+  id: string,
+): Promise<{ bytes: Buffer; contentType: string; publicUrl?: string } | null> {
+  if (!isMediaId(id)) return null;
+  try {
+    const result = await get(blobPath(id), { access: "public", ...blobOpts() });
+    if (!result || result.statusCode !== 200) return null;
+    const bytes = Buffer.from(await new Response(result.stream).arrayBuffer());
+    return {
+      bytes,
+      contentType: result.blob.contentType || "application/octet-stream",
+      publicUrl: result.blob.url,
+    };
   } catch {
     return null;
   }

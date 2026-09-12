@@ -58,8 +58,8 @@ export async function POST(request: Request): Promise<Response> {
       }
 
       const jpeg = await readFile(outputPath);
-      const id = await saveUpload(new Uint8Array(jpeg), "image/jpeg", "last-frame.jpg");
-      return Response.json({ id, url: `agnes-media:${id}` });
+      const stored = await saveUpload(new Uint8Array(jpeg), "image/jpeg", "last-frame.jpg");
+      return Response.json({ id: stored.id, url: stored.url });
     });
   } catch {
     return jsonError(502, "Could not extract the last frame.");

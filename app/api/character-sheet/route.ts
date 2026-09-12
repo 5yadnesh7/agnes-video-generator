@@ -72,6 +72,11 @@ export async function POST(request: Request): Promise<Response> {
     return withKeyCookie(jsonError(image.status, image.detail), override);
   }
 
-  const id = await saveUpload(new Uint8Array(image.bytes), image.contentType, "character-sheet.png");
-  return withKeyCookie(Response.json({ id, url: `agnes-media:${id}` }), override);
+  try {
+    const stored = await saveUpload(new Uint8Array(image.bytes), image.contentType, "character-sheet.png");
+    return withKeyCookie(Response.json({ id: stored.id, url: stored.url }), override);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "Could not store this file.";
+    return withKeyCookie(jsonError(502, detail), override);
+  }
 }

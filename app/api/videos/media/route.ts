@@ -4,6 +4,7 @@ import {
   MAX_UPLOAD_BYTES,
   saveUpload,
 } from "@/lib/media/store";
+import { isPublicHttpsUrl } from "@/lib/agnes/types";
 
 export const maxDuration = 30;
 
@@ -38,10 +39,14 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   try {
-    const id = await saveUpload(bytes, classified.contentType, file.name);
+    const stored = await saveUpload(bytes, classified.contentType, file.name);
     const origin = getPublicAppOrigin();
-    const url = origin.ok ? `${origin.origin}/api/media/${id}` : `agnes-media:${id}`;
-    return Response.json({ id, url });
+    const url = isPublicHttpsUrl(stored.url)
+      ? stored.url
+      : origin.ok
+        ? `${origin.origin}/api/media/${stored.id}`
+        : stored.url;
+    return Response.json({ id: stored.id, url });
   } catch {
     return jsonError(502, "Could not store this file. Try again, or paste a public https:// URL.");
   }

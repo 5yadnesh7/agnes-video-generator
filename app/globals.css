@@ -257,6 +257,14 @@ video:focus-visible {
 
 .generate-bar {
   margin-top: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.generate-bar .hint {
+  flex: 1 1 100%;
 }
 
 @media (min-width: 900px) {
@@ -283,8 +291,52 @@ video:focus-visible {
   .shell {
     position: sticky;
     top: 0;
-    z-index: 5;
-    padding: 0.55rem 0.9rem;
+    z-index: 6;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "brand mode"
+      "key key"
+      "actions actions";
+    align-items: center;
+    gap: 0.4rem 0.55rem;
+    padding: max(0.5rem, env(safe-area-inset-top, 0px)) 0.9rem 0.55rem;
+  }
+
+  .shell .brand {
+    grid-area: brand;
+    min-width: 0;
+  }
+
+  .shell > .seg {
+    grid-area: mode;
+    justify-self: end;
+  }
+
+  .shell .key-field {
+    grid-area: key;
+    flex: none;
+    min-width: 0;
+    max-width: none;
+    width: 100%;
+  }
+
+  .shell .shell-actions {
+    grid-area: actions;
+    margin-left: 0;
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .shell .shell-actions .btn {
+    min-height: 2.75rem;
+  }
+
+  .seg span {
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+    padding: 0.35rem 0.7rem;
   }
 
   .layout {
@@ -296,7 +348,7 @@ video:focus-visible {
 
   .job {
     position: sticky;
-    top: 3.15rem;
+    top: 12rem;
     z-index: 3;
     padding: 0.5rem 1.05rem 0.7rem;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
@@ -316,8 +368,18 @@ video:focus-visible {
     border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  .generate-bar .btn-primary {
+  .generate-bar .btn {
     width: 100%;
+  }
+
+  textarea,
+  select,
+  input[type="number"],
+  input[type="url"],
+  input[type="text"],
+  input[type="password"],
+  input[type="file"] {
+    font-size: 16px;
   }
 }
 
@@ -873,6 +935,14 @@ select.story-minutes {
   margin-top: 0.25rem;
 }
 
+.scene-beat textarea.prompt-clip {
+  display: block;
+  width: 100%;
+  min-height: 8rem;
+  resize: vertical;
+  scroll-margin-bottom: 9rem;
+}
+
 .scene-slot.is-incomplete {
   border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
 }
@@ -1125,6 +1195,10 @@ select.story-minutes {
   padding: 0.75rem 0;
 }
 
+.merge-result {
+  margin-top: 0.85rem;
+}
+
 .merge-bar label.check {
   display: flex;
   align-items: flex-start;
@@ -1157,17 +1231,20 @@ select.story-minutes {
 @media (max-width: 899px) {
   .pipeline {
     position: sticky;
-    top: 3.15rem;
-    z-index: 4;
-    padding: 0.4rem 0.75rem;
-    flex-wrap: wrap;
-    overflow-x: hidden;
+    top: 12rem;
+    z-index: 5;
+    padding: 0.35rem 0.75rem;
+    flex-wrap: nowrap;
+    overflow: hidden;
+    gap: 0.35rem;
   }
 
   .pipeline-steps {
-    flex: 1 1 100%;
+    flex: 1 1 auto;
     justify-content: space-between;
     min-width: 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
   .pipeline-join {
@@ -1175,25 +1252,24 @@ select.story-minutes {
   }
 
   .pipeline-step {
-    padding: 0.22rem 0.35rem;
+    padding: 0.35rem 0.4rem;
     letter-spacing: 0.04em;
     font-size: 0.62rem;
+    min-height: 2.75rem;
+    display: inline-flex;
+    align-items: center;
   }
 
-  .pipeline .btn {
-    flex: 1 1 100%;
+  .story-root .pipeline .btn {
+    flex: 0 0 auto;
+    width: auto;
     min-height: 2.75rem;
+    min-width: 2.75rem;
   }
 
   .scene-slot .btn,
   .clip-actions .btn {
     min-height: 2.75rem;
-  }
-
-  .story-queue {
-    position: sticky;
-    top: 5.35rem;
-    z-index: 3;
   }
 
   .clip-body {
@@ -1239,5 +1315,120 @@ select.story-minutes {
 
   .zoom-dialog img {
     max-height: calc(100dvh - 6rem);
+  }
+
+  .story-root {
+    overflow-x: clip;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .story-root .layout {
+    grid-template-areas:
+      "form"
+      "job";
+  }
+
+  .story-root .job {
+    position: static;
+    top: auto;
+    z-index: auto;
+    max-height: none;
+    overflow: visible;
+    padding: 0.85rem 1.05rem 1.15rem;
+    border-bottom: 0;
+  }
+
+  .story-root .layout-input .job:not(:has(.job-run)):not(:has(.form-error)) {
+    display: none;
+  }
+
+  .story-root .layout-input .job {
+    padding-bottom: 1rem;
+  }
+
+  .story-root .request {
+    padding-bottom: 1.15rem;
+  }
+
+  .story-root .layout-input .request {
+    padding-bottom: 6.5rem;
+  }
+
+  .story-root .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .story-root .pill-row {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    padding-bottom: 0.15rem;
+    margin-inline: -0.15rem;
+    padding-inline: 0.15rem;
+  }
+
+  .story-root .pill-row span {
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+    white-space: nowrap;
+    padding: 0.35rem 0.85rem;
+  }
+
+  .story-root .dock-secondary {
+    display: none;
+  }
+
+  .story-root .job .generate-bar .hint {
+    display: none;
+  }
+
+  .story-root .scene-fold > summary {
+    min-height: 2.75rem;
+    align-items: center;
+  }
+
+  .story-root .scene-beat textarea.prompt-clip,
+  .story-root .clip-prompt textarea.prompt-clip,
+  .story-root .scene-fold textarea.prompt-clip {
+    min-height: 6.5rem;
+    scroll-margin-bottom: 6.5rem;
+    scroll-margin-top: 12rem;
+  }
+
+  .story-root .textarea-story {
+    min-height: 8rem;
+  }
+
+  .story-root .clip-actions {
+    flex-direction: column;
+  }
+
+  .story-root .clip-actions .btn,
+  .story-root .clip-actions a.btn {
+    width: 100%;
+  }
+
+  .story-root .story-clips {
+    padding: 0.75rem 1.05rem 7.5rem;
+  }
+
+  .story-root .story-queue-actions .btn {
+    width: 100%;
+    min-height: 2.75rem;
+  }
+
+  .story-root .scene-fold-actions .btn {
+    min-height: 2.75rem;
+    flex: 1 1 calc(50% - 0.35rem);
+  }
+
+  .merge-result {
+    margin: 0.85rem 0 1rem;
+  }
+
+  .merge-result .player {
+    max-height: 40dvh;
   }
 }
