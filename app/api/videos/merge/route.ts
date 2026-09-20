@@ -82,7 +82,7 @@ export async function POST(request: Request): Promise<Response> {
       }
 
       const mp4 = await readFile(outputPath);
-      const stored = await saveUpload(new Uint8Array(mp4), "video/mp4", "merged.mp4");
+      const stored = await saveUpload(new Uint8Array(mp4), "video/mp4", "merged.mp4", "generated");
       return Response.json({ id: stored.id, url: stored.url.startsWith("agnes-media:") ? `/api/media/${stored.id}` : stored.url });
     });
   } catch {

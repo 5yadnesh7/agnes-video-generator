@@ -1,11 +1,40 @@
 import "server-only";
 
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-export const FFMPEG_MISSING = "Install ffmpeg locally to extract frames and merge.";
+import ffmpegStatic from "ffmpeg-static";
+
+export const FFMPEG_MISSING = "FFmpeg is not available on this server.";
+
+let resolvedBin: string | null | undefined;
+
+async function ffmpegBin(): Promise<string | null> {
+  if (resolvedBin !== undefined) return resolvedBin;
+  const src = typeof ffmpegStatic === "string" ? ffmpegStatic : null;
+  if (!src) {
+    resolvedBin = null;
+    return null;
+  }
+  try {
+    await chmod(src, 0o755);
+    resolvedBin = src;
+    return src;
+  } catch {
+    const dest = path.join(tmpdir(), "agnes-ffmpeg");
+    try {
+      await copyFile(src, dest);
+      await chmod(dest, 0o755);
+      resolvedBin = dest;
+      return dest;
+    } catch {
+      resolvedBin = src;
+      return src;
+    }
+  }
+}
 
 export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agnes-"));
@@ -16,11 +45,13 @@ export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T
   }
 }
 
-export function runFfmpeg(
+export async function runFfmpeg(
   args: string[],
 ): Promise<{ ok: true } | { ok: false; missing: boolean }> {
+  const bin = await ffmpegBin();
+  if (!bin) return { ok: false, missing: true };
   return new Promise((resolve) => {
-    const child = spawn("ffmpeg", args, { windowsHide: true, stdio: "ignore" });
+    const child = spawn(bin, args, { windowsHide: true, stdio: "ignore" });
     child.on("error", (err) => {
       const code = (err as NodeJS.ErrnoException).code;
       resolve({ ok: false, missing: code === "ENOENT" });

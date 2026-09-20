@@ -2,6 +2,24 @@ export const MODEL_V20 = "agnes-video-v2.0" as const;
 export const MODEL_FLASH = "agnes-video-2.5-flash" as const;
 
 export const POLL_CAP_MS = 15 * 60 * 1000;
+/** Extra wait after Agnes "too many video status queries" before the next status call. */
+export const STATUS_QUERY_LIMIT_BACKOFF_MS = 60_000;
+
+/**
+ * Sleep before each Agnes status call. pollIndex 0 is the first wait after create.
+ * 5s once, then 60s twice, then 30s twice, then 20s three times, then 10s until abort/complete.
+ * Rate-limit ("too many status queries") inserts 1 min without advancing this sequence.
+ * `resume` skips the long warmup (SSE reconnect / tab coming back).
+ */
+export function agnesPollDelayMs(pollIndex: number, resume = false): number {
+  if (resume) return pollIndex === 0 ? 1_000 : 10_000;
+  const i = Math.max(0, pollIndex);
+  if (i === 0) return 5_000;
+  if (i <= 2) return 60_000;
+  if (i <= 4) return 30_000;
+  if (i <= 7) return 20_000;
+  return 10_000;
+}
 
 export const STORY_CREATE_GAP_MS = 65_000;
 export const STORY_SCENE_MIN = 2;
@@ -13,22 +31,6 @@ export const STORY_MAX_TOTAL_SEC = STORY_MINUTES_MAX * 60;
 /** JSON/merge safety only: 10 min at Flash's shortest clip. Product cap is 10 min, not scene count. */
 export const STORY_SCENE_HARD_MAX = 150;
 export const STORY_CHARACTER_MAX = 5;
-
-/** Sleep before the Agnes status call at this 0-based index. First call is at 30s, not t=0. */
-export function agnesPollDelayMs(pollIndex: number): number {
-  const i = Math.max(0, pollIndex);
-  if (i <= 1) return 30_000;
-  if (i <= 4) return 20_000;
-  return 10_000;
-}
-
-/** Story SSE: time-based delay from stream start. First wait is 30s (not t=0). */
-export function storyPollDelayMs(elapsedMs: number): number {
-  const elapsed = Math.max(0, elapsedMs);
-  if (elapsed < 120_000) return 30_000;
-  if (elapsed < 240_000) return 20_000;
-  return 10_000;
-}
 
 export const UPSTREAM_TIMEOUT_MS = 20_000;
 
@@ -80,6 +82,8 @@ export const V20_REFERENCE_HINT =
 export const FLASH_SECONDS_MIN = 4;
 export const FLASH_SECONDS_MAX = 12;
 export const FLASH_DEFAULT_SECONDS = "5";
+/** Storyboard Flash clips are always the model hard max. */
+export const FLASH_STORY_SECONDS = FLASH_SECONDS_MAX;
 export const FLASH_SIZE = "720P" as const;
 /** Agnes Flash reference: images length must not exceed 5. */
 export const FLASH_IMAGE_MAX = 5;
@@ -94,8 +98,8 @@ export const IMAGE_MODELS = [
   { id: "agnes-image-2.5-flash", label: "Agnes Image 2.5 Flash" },
 ] as const;
 export type ImageModelId = (typeof IMAGE_MODELS)[number]["id"];
-/** Current story default — 2.1 Flash. */
-export const DEFAULT_IMAGE_MODEL: ImageModelId = "agnes-image-2.1-flash";
+/** Current story default — 2.5 Flash. */
+export const DEFAULT_IMAGE_MODEL: ImageModelId = "agnes-image-2.5-flash";
 
 export function isImageModelId(value: unknown): value is ImageModelId {
   return typeof value === "string" && IMAGE_MODELS.some((m) => m.id === value);
@@ -233,9 +237,7 @@ export function snapStoryDuration(
   maxFrames: number = V20_MAX_FRAMES["720p"],
 ): number {
   if (model === MODEL_FLASH) {
-    const n = Math.round(durationSec);
-    if (!Number.isFinite(n)) return FLASH_SECONDS_MIN;
-    return Math.min(FLASH_SECONDS_MAX, Math.max(FLASH_SECONDS_MIN, n));
+    return FLASH_STORY_SECONDS;
   }
   return nearestV20Duration(durationSec, fps, maxFrames);
 }
@@ -246,9 +248,7 @@ export function storyTiming(
   maxFrames: number = V20_MAX_FRAMES["720p"],
 ): { min: number; max: number; options: number[] } {
   if (model === MODEL_FLASH) {
-    const options: number[] = [];
-    for (let s = FLASH_SECONDS_MIN; s <= FLASH_SECONDS_MAX; s += 1) options.push(s);
-    return { min: FLASH_SECONDS_MIN, max: FLASH_SECONDS_MAX, options };
+    return { min: FLASH_STORY_SECONDS, max: FLASH_STORY_SECONDS, options: [FLASH_STORY_SECONDS] };
   }
   const options = allowedV20Durations(fps, maxFrames);
   return {
@@ -276,12 +276,24 @@ export function storyClipMinSec(
   return storyTiming(model, fps, maxFrames).min;
 }
 
+export function flashStorySceneCount(minutes: number): number {
+  const budget = Math.min(STORY_MAX_TOTAL_SEC, clampStoryMinutes(minutes) * 60);
+  return Math.min(
+    STORY_SCENE_HARD_MAX,
+    Math.max(STORY_SCENE_MIN, Math.round(budget / FLASH_STORY_SECONDS)),
+  );
+}
+
 export function storySceneRange(
   minutes: number,
   model: typeof MODEL_V20 | typeof MODEL_FLASH,
   fps: number = DEFAULT_FRAME_RATE,
   maxFrames: number = V20_MAX_FRAMES["720p"],
 ): { min: number; max: number } {
+  if (model === MODEL_FLASH) {
+    const n = flashStorySceneCount(minutes);
+    return { min: n, max: n };
+  }
   const budget = Math.min(STORY_MAX_TOTAL_SEC, clampStoryMinutes(minutes) * 60);
   const long = storyClipTargetSec(model, fps, maxFrames);
   const short = storyClipMinSec(model, fps, maxFrames);

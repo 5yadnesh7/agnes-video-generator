@@ -1,6 +1,6 @@
 import "server-only";
 
-import { MODEL_FLASH, MODEL_V20, STORY_CHARACTER_MAX, storyTiming } from "./constants";
+import { MODEL_FLASH, MODEL_V20, STORY_CHARACTER_MAX, flashStorySceneCount, storyTiming } from "./constants";
 
 export function storyboardMessages(
   source: "topic" | "story",
@@ -11,10 +11,15 @@ export function storyboardMessages(
   maxFrames: number,
 ): { role: "system" | "user"; content: string }[] {
   const timing = storyTiming(videoModel, fps, maxFrames);
+  const flashCount = videoModel === MODEL_FLASH ? flashStorySceneCount(minutes) : 0;
   const durationRule =
     videoModel === MODEL_FLASH
-      ? `Each duration_sec is an integer from ${timing.min} to ${timing.max} matching THAT beat. Short glance near ${timing.min}, long action up to ${timing.max}. Do NOT set every scene to ${timing.max}.`
+      ? `Each duration_sec MUST be exactly ${timing.max}. Flash 2.5 hard max is ${timing.max}s. Never use another length.`
       : `Each duration_sec must be one of: ${timing.options.join(", ")} (legal at ${fps} fps for this resolution; max ${timing.max}s). Pick the length that fits the beat. Do NOT set every scene to ${timing.max}.`;
+  const sceneCountRule =
+    videoModel === MODEL_FLASH
+      ? `scenes: EXACTLY ${flashCount} scenes. Each duration_sec is ${timing.max}. Sum is ${flashCount * timing.max} seconds (~${minutes} min). At least 2.`
+      : `scenes: as many as needed so the SUM of duration_sec is about ${minutes * 60} seconds (the ${minutes} min film). At least 2. There is no small scene cap.`;
 
   const system = `You are a cinematic storyboard artist. Reply with one JSON object only. No markdown.
 
@@ -55,10 +60,10 @@ Rules:
 - character.role: protagonist, ally, antagonist, mentor, etc.
 - character.appearance: extracted from the story — age, body, face, hair, clothes, colors, props. Detailed enough to redraw identically. If the story is vague, invent a locked look that fits.
 - character.sheet_prompt: English extras for a LABELED character MODEL SHEET of THIS ONE person only. Must say the character's NAME is printed large on the sheet. Layout: hero pose + Turnaround Views (Front/Side/Back, captioned) + Facial Expressions (captioned) + Close-up Details + Key Props + Color Palette. Same face and outfit in every panel. Not a film still, not a group photo, not an unlabeled 3-pose strip. Repeat appearance details.
-- scenes: as many as needed so the SUM of duration_sec is about ${minutes * 60} seconds (the ${minutes} min film). At least 2. There is no small scene cap.
+- ${sceneCountRule}
 - title: a few words, no numbers.
 - ${durationRule}
-- Duration depends on the scene: a look or line is short; a chase or song can use a long clip. Never make every scene the maximum.
+- ${videoModel === MODEL_FLASH ? `Every scene is ${timing.max}s. Do not vary clip length.` : "Duration depends on the scene: a look or line is short; a chase or song can use a long clip. Never make every scene the maximum."}
 - cast: names from characters[] who appear in this shot. 1 or more. Never a character who is not in characters[].
 - setting: place only.
 - subject: who is on screen and what they wear (must match those characters' appearance).
@@ -72,8 +77,8 @@ Rules:
 
   const user =
     source === "topic"
-      ? `Write a cinematic story from this topic, in the same language as the topic, paced for about ${minutes} minute(s). Follow the topic's genre, audience, and tone — do not turn it into a children's story unless the topic is for children. Extract up to ${STORY_CHARACTER_MAX} main characters with separate labeled model-sheet extras (name printed on each sheet). Then fill the JSON. Scene lengths must follow each beat, not all max.\n\nTopic:\n${text}`
-      : `Refine this story for picture: clearer, cinematic, keep the author's intent, genre, audience, tone, and language, paced for about ${minutes} minute(s). Do not rewrite it as a children's story unless the author wrote one. Extract up to ${STORY_CHARACTER_MAX} main characters from the text with separate labeled model-sheet extras (name printed on each sheet). Then fill the JSON. Scene lengths must follow each beat, not all max.\n\nStory:\n${text}`;
+      ? `Write a cinematic story from this topic, in the same language as the topic, paced for about ${minutes} minute(s). Follow the topic's genre, audience, and tone — do not turn it into a children's story unless the topic is for children. Extract up to ${STORY_CHARACTER_MAX} main characters with separate labeled model-sheet extras (name printed on each sheet). Then fill the JSON.${videoModel === MODEL_FLASH ? ` Return exactly ${flashCount} scenes, each duration_sec ${timing.max}.` : " Scene lengths must follow each beat, not all max."}\n\nTopic:\n${text}`
+      : `Refine this story for picture: clearer, cinematic, keep the author's intent, genre, audience, tone, and language, paced for about ${minutes} minute(s). Do not rewrite it as a children's story unless the author wrote one. Extract up to ${STORY_CHARACTER_MAX} main characters from the text with separate labeled model-sheet extras (name printed on each sheet). Then fill the JSON.${videoModel === MODEL_FLASH ? ` Return exactly ${flashCount} scenes, each duration_sec ${timing.max}.` : " Scene lengths must follow each beat, not all max."}\n\nStory:\n${text}`;
 
   return [
     { role: "system", content: system },
@@ -92,7 +97,7 @@ export function storyboardContinueMessages(
   const timing = storyTiming(videoModel, fps, maxFrames);
   const durationRule =
     videoModel === MODEL_FLASH
-      ? `duration_sec ${timing.min}–${timing.max} per beat, not all ${timing.max}.`
+      ? `duration_sec MUST be exactly ${timing.max} for every new scene.`
       : `duration_sec one of ${timing.options.join(", ")} at ${fps} fps, max ${timing.max}s, per beat.`;
   const listed = existingTitles.map((title, i) => `${i + 1}. ${title}`).join("\n");
   const system = `You continue a cinematic storyboard. Reply with one JSON object only. No markdown.

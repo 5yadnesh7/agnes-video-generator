@@ -58,7 +58,7 @@ export async function POST(request: Request): Promise<Response> {
       }
 
       const jpeg = await readFile(outputPath);
-      const stored = await saveUpload(new Uint8Array(jpeg), "image/jpeg", "last-frame.jpg");
+      const stored = await saveUpload(new Uint8Array(jpeg), "image/jpeg", "last-frame.jpg", "generated");
       return Response.json({ id: stored.id, url: stored.url });
     });
   } catch {

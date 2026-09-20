@@ -1190,9 +1190,279 @@ select.story-minutes {
   min-height: 2.5rem;
 }
 
-.merge-bar {
-  margin-top: 0.85rem;
-  padding: 0.75rem 0;
+.prompt-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0 0 0.5rem;
+}
+
+.prompt-chip {
+  position: relative;
+  width: 3.5rem;
+  height: 3.5rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.prompt-chip img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.prompt-chip-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.prompt-chip-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.1rem 0.15rem;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: #fff;
+  background: color-mix(in srgb, #1a1611 72%, transparent);
+  text-align: center;
+  line-height: 1.2;
+}
+
+.prompt-chip.is-muted {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.prompt-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.prompt-composer-wrap {
+  position: relative;
+}
+
+.prompt-composer {
+  min-height: 8rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+}
+
+.prompt-composer.is-short {
+  min-height: 4.2rem;
+}
+
+.prompt-composer.is-clip {
+  min-height: 9rem;
+}
+
+.prompt-mention {
+  position: fixed;
+  z-index: 40;
+  min-width: 11.5rem;
+  max-width: 16rem;
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0.22rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 10px 28px color-mix(in srgb, #000 22%, transparent);
+}
+
+.prompt-mention button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0.32rem 0.4rem;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.prompt-mention button.is-active,
+.prompt-mention button:hover {
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+}
+
+.prompt-mention img {
+  width: 1.2rem;
+  height: 1.2rem;
+  border-radius: 999px;
+  object-fit: cover;
+}
+
+.prompt-mention-empty {
+  margin: 0;
+  padding: 0.4rem 0.45rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.prompt-composer:focus {
+  outline: none;
+}
+
+.prompt-composer:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.prompt-composer:empty::before {
+  content: attr(data-placeholder);
+  color: var(--muted);
+}
+
+.prompt-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  margin: 0 0.12rem;
+  padding: 0.08rem 0.4rem 0.08rem 0.08rem;
+  vertical-align: middle;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.2;
+  user-select: none;
+}
+
+.prompt-inline img,
+.prompt-inline-glyph {
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  object-fit: cover;
+  background: color-mix(in srgb, var(--border) 55%, var(--surface));
+  flex: 0 0 auto;
+}
+
+.prompt-inline-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.62rem;
+}
+
+.prompt-inline-name {
+  color: var(--text);
+}
+
+.clip-timeline {
+  margin: 0 0 0.85rem;
+}
+
+.tl-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.85rem;
+  margin: 0 0 0.5rem;
+}
+
+.tl-timing {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.tl-timing input {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+.tl-transport {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.tl-strip {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0.15rem 0 0.35rem;
+}
+
+.tl-block {
+  flex: 0 0 auto;
+  min-width: 7.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.tl-block.is-active {
+  border-color: var(--accent);
+}
+
+.tl-hit {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: grab;
+  color: inherit;
+}
+
+.tl-hit img,
+.tl-empty {
+  display: block;
+  width: 100%;
+  height: 4.2rem;
+  object-fit: cover;
+  background: color-mix(in srgb, var(--border) 55%, var(--surface));
+}
+
+.tl-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.35rem;
+  padding: 0.3rem 0.4rem 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.tl-hit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .merge-result {

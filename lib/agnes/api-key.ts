@@ -8,8 +8,25 @@ function trimKey(value: unknown): string | null {
   return trimmed.length > 0 && trimmed.length < 512 ? trimmed : null;
 }
 
-export function envApiKey(): string | null {
+export function envVideoKey(): string | null {
   return trimKey(process.env.AGNES_API_KEY);
+}
+
+export function envStoryKey(): string | null {
+  return trimKey(process.env.AGNES_API_KEY2);
+}
+
+/** Video create / poll. */
+export function envApiKey(): string | null {
+  return envVideoKey();
+}
+
+export function missingVideoKeyCopy(): string {
+  return "Add an Agnes API key in the header, or set AGNES_API_KEY in .env and restart.";
+}
+
+export function missingStoryKeyCopy(): string {
+  return "Set AGNES_API_KEY2 in .env for storyboard, character sheets, and stills, then restart.";
 }
 
 export function overrideFromBody(value: unknown): string | null {

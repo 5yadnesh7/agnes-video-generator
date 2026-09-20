@@ -44,6 +44,7 @@ export function formatStoryShot(
   keyframes?: {
     hasStart: boolean;
     hasEnd: boolean;
+    startIsGenerated?: boolean;
     prevEnd?: Pick<StoryShot, "setting" | "subject" | "action">;
     extraPrompt?: string;
   },
@@ -55,14 +56,20 @@ export function formatStoryShot(
 
   if (keyframes?.hasStart && keyframes.hasEnd) {
     const prev = keyframes.prevEnd;
-    lines.push(
-      "Continuity: OPEN on the START image (first attached still). That picture is the last frame of the previous scene. First frames must match it — same people, pose, place, framing. Do not cut in on a new angle.",
-    );
-    if (prev) {
-      const bits = [prev.setting.trim(), prev.subject.trim(), prev.action.trim() ? `after: ${prev.action.trim()}` : ""]
-        .filter(Boolean)
-        .join(". ");
-      if (bits) lines.push(`The start image is that previous landing: ${bits}.`);
+    if (keyframes.startIsGenerated) {
+      lines.push(
+        "Continuity: OPEN on the START image (first attached still). That picture is the opening of this scene after the previous image-to-video beat. First frames must match it — same people, pose, place, framing.",
+      );
+    } else {
+      lines.push(
+        "Continuity: OPEN on the START image (first attached still). That picture is the last frame of the previous scene. First frames must match it — same people, pose, place, framing. Do not cut in on a new angle.",
+      );
+      if (prev) {
+        const bits = [prev.setting.trim(), prev.subject.trim(), prev.action.trim() ? `after: ${prev.action.trim()}` : ""]
+          .filter(Boolean)
+          .join(". ");
+        if (bits) lines.push(`The start image is that previous landing: ${bits}.`);
+      }
     }
     lines.push(
       `Then continue from that exact picture into this scene's action: ${action}`,
@@ -99,6 +106,39 @@ export function formatStoryShot(
     }
   }
   return lines.join("\n");
+}
+
+function castKey(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+/**
+ * Scene 1, and any later beat that introduces a named character who has not
+ * appeared yet, is image-to-video from character sheets — no generated start/end stills.
+ */
+export function sceneUsesSheetI2V(scenes: { cast?: string[] }[], index: number): boolean {
+  if (index <= 0) return true;
+  const seen = new Set<string>();
+  for (let i = 0; i < index; i += 1) {
+    for (const name of scenes[i]?.cast ?? []) {
+      const key = castKey(name);
+      if (key) seen.add(key);
+    }
+  }
+  const mine = (scenes[index]?.cast ?? []).map(castKey).filter(Boolean);
+  if (mine.length === 0) return false;
+  if (seen.size === 0) return true;
+  return mine.some((name) => !seen.has(name));
+}
+
+/**
+ * Scene N needs its own opening still when N-1 was sheet I2V (no end keyframe).
+ * Otherwise start of N is the end still of N-1.
+ */
+export function sceneNeedsGeneratedStart(scenes: { cast?: string[] }[], index: number): boolean {
+  if (index <= 0) return false;
+  if (sceneUsesSheetI2V(scenes, index)) return false;
+  return sceneUsesSheetI2V(scenes, index - 1);
 }
 
 const STORY_BRIEF_MAX = 700;
@@ -150,8 +190,44 @@ export const SCENE_STILL_RETRY_TAIL =
 
 export const SCENE_STILL_MAX_ATTEMPTS = 3;
 
+export function sceneStartStillPrompt(
+  scene: Pick<StoryShot, "setting" | "subject" | "action" | "camera_movement" | "lighting" | "style" | "dialogue">,
+  characters: StoryCharacterLock[],
+  filmStyle: string,
+  storyBrief?: string,
+): string {
+  const who = characters
+    .map((c) => `${c.name.trim()}${c.appearance.trim() ? `: ${c.appearance.trim()}` : ""}`)
+    .filter((line) => line.trim())
+    .join(". ");
+  const names = characters.map((c) => c.name.trim()).filter(Boolean);
+  const brief = clipStoryBrief(storyBrief ?? "");
+  const tone = filmStyle.trim() || scene.style.trim();
+  return [
+    "One cinematic opening-frame still for this film. A single live camera shot from a finished movie beat.",
+    "Rules: one frame only. Not a spritesheet, character model sheet, turnaround, pose grid, collage, comic panel, storyboard, split screen, or bible page.",
+    "Each named character appears exactly once. No duplicate of the same named character.",
+    "No printed names, captions, color palettes, or reference-board chrome.",
+    "Follow this story's genre, audience, medium, and tone only. Do not substitute a different genre.",
+    brief ? `Story (world and tone to follow): ${brief}` : "",
+    "This is where the scene OPENS — the first pose and framing before the action plays.",
+    `Setting: ${scene.setting.trim()}`,
+    `Who is on screen: ${scene.subject.trim()}`,
+    names.length > 0 ? `Named cast (each once): ${names.join(", ")}` : "",
+    `Action that is about to begin: ${scene.action.trim()}`,
+    scene.camera_movement.trim() ? `Camera: ${scene.camera_movement.trim()}` : "",
+    scene.lighting.trim() ? `Lighting: ${scene.lighting.trim()}` : "",
+    who ? `Characters must match: ${who}` : "",
+    tone ? `Art style: ${tone}` : "",
+    "Clear faces, same outfits as described, no text overlay, no watermark.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export function isComposedStillPrompt(text: string): boolean {
-  return text.trim().startsWith("One cinematic last-frame still");
+  const t = text.trim();
+  return t.startsWith("One cinematic last-frame still") || t.startsWith("One cinematic opening-frame still");
 }
 
 export function sceneStillJudgeSystem(): string {

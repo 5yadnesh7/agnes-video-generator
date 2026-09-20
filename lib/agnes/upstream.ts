@@ -1,6 +1,7 @@
 import "server-only";
 
 import { DEFAULT_IMAGE_MODEL, isImageModelId, UPSTREAM_TIMEOUT_MS, MODEL_FLASH, MODEL_V20 } from "./constants";
+import { humanizeAgnesDetail, isAgnesStatusQueryLimit } from "./errors";
 import { getAgnesOrigin } from "./origin";
 import {
   isJobStatus,
@@ -108,12 +109,8 @@ function defaultErrorCopy(status: number): string {
   return "Agnes is unavailable or the job was not found.";
 }
 
-/** Agnes 401s often say 无效的令牌 even when their DB lookup is broken. */
 function humanizeDetail(detail: string): string {
-  if (detail.includes("无效的令牌")) {
-    return "Agnes rejected the API token (401) and reported a database error on their side. Wait, then retry. If it keeps failing, check AGNES_API_KEY.";
-  }
-  return detail;
+  return humanizeAgnesDetail(detail);
 }
 
 function missingKeyCopy(): string {
@@ -237,10 +234,8 @@ async function mapAgnesResponse(
 
   if (!res.ok) {
     const mapped = mapHttpStatus(res.status);
-    return jsonError(
-      mapped,
-      humanizeDetail(extractDetail(parsed) ?? defaultErrorCopy(mapped)),
-    );
+    const detail = humanizeDetail(extractDetail(parsed) ?? defaultErrorCopy(mapped));
+    return jsonError(isAgnesStatusQueryLimit(detail) ? 429 : mapped, detail);
   }
 
   if (kind === "create") {
@@ -253,7 +248,13 @@ async function mapAgnesResponse(
   }
 
   const body = shapeStatusSuccess(parsed);
-  if (!body) return jsonError(502, "Agnes is unavailable or the job was not found.");
+  if (!body) {
+    const detail = extractDetail(parsed);
+    if (detail && isAgnesStatusQueryLimit(detail)) {
+      return jsonError(429, humanizeDetail(detail));
+    }
+    return jsonError(502, "Agnes is unavailable or the job was not found.");
+  }
   return Response.json(body);
 }
 
@@ -335,14 +336,19 @@ export async function parsePollResponse(
     parsed = null;
   }
   if (!res.ok) {
+    const detail = humanizeDetail(extractDetail(parsed) ?? defaultErrorCopy(res.status));
     return {
       ok: false,
-      status: res.status,
-      detail: humanizeDetail(extractDetail(parsed) ?? defaultErrorCopy(res.status)),
+      status: isAgnesStatusQueryLimit(detail) ? 429 : res.status,
+      detail,
     };
   }
   const data = shapeStatusSuccess(parsed);
   if (!data) {
+    const detail = extractDetail(parsed);
+    if (detail && isAgnesStatusQueryLimit(detail)) {
+      return { ok: false, status: 429, detail: humanizeDetail(detail) };
+    }
     return {
       ok: false,
       status: 502,
@@ -353,7 +359,7 @@ export async function parsePollResponse(
 }
 
 const CHAT_TIMEOUT_MS = 90_000;
-const STORYBOARD_CHAT_MODEL = "agnes-2.5-flash";
+const STORYBOARD_CHAT_MODEL = "agnes-3.0-flash";
 
 function shapeChatContent(parsed: unknown): string | null {
   if (!isRecord(parsed)) return null;

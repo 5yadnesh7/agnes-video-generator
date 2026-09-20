@@ -2,6 +2,9 @@
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type Dispatch, type FormEvent, type SetStateAction } from "react";
 
+import { humanizeAgnesDetail } from "@/lib/agnes/errors";
+import { abortServerJob, openJobSse } from "@/lib/client/job-sse";
+import { PromptComposer, type PromptChipItem } from "@/components/prompt-media-chips";
 import { StoryWorkbench, type StoryWorkbenchHandle } from "@/components/story-workbench";
 import {
   allowedV20Durations,
@@ -36,6 +39,7 @@ import {
 import {
   isAgnesMediaRef,
   isJobStatus,
+  isModelId,
   isPublicHttpsUrl,
   type CreateRequest,
   type CreateSuccess,
@@ -58,6 +62,7 @@ const AUDIO_ACCEPT = "audio/mpeg,audio/wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.a
 const MP4_HINT =
   "If the player fails, the file host may be unreachable on this network. Try another network or DNS. Do not disable TLS.";
 const KEY_BANNER = "Add an Agnes API key in the header, or set AGNES_API_KEY in .env and restart.";
+const GEN_JOB_KEY = "agnes-generate-job-v1";
 
 type FieldErrors = Partial<Record<string, string>>;
 
@@ -98,7 +103,7 @@ async function readDetail(res: Response): Promise<string> {
       "detail" in body &&
       typeof (body as { detail: unknown }).detail === "string"
     ) {
-      return (body as { detail: string }).detail;
+      return humanizeAgnesDetail((body as { detail: string }).detail);
     }
   } catch {
     /* ignore malformed error bodies */
@@ -131,18 +136,6 @@ function parseStatusBody(body: unknown): StatusSuccess | null {
     video_id: typeof rec.video_id === "string" ? rec.video_id : undefined,
     progress: typeof rec.progress === "number" ? rec.progress : undefined,
   };
-}
-
-function parseEventPayload(raw: string): Record<string, unknown> | null {
-  try {
-    const body: unknown = JSON.parse(raw);
-    if (typeof body === "object" && body !== null && !Array.isArray(body)) {
-      return body as Record<string, unknown>;
-    }
-  } catch {
-    /* ignore malformed event bodies */
-  }
-  return null;
 }
 
 type StatusFetch =
@@ -280,6 +273,7 @@ type MediaItem = {
   label: string;
   storing: boolean;
   error?: string;
+  file?: File;
 };
 
 type SingleSlot = {
@@ -288,6 +282,7 @@ type SingleSlot = {
   paste: string;
   storing: boolean;
   fileKey: number;
+  pendingFile?: File;
 };
 
 const EMPTY_SLOT: SingleSlot = { url: "", fileName: "", paste: "", storing: false, fileKey: 0 };
@@ -320,6 +315,7 @@ function SingleMediaSlot({
   onFiles,
   onPaste,
   onRemove,
+  onRetry,
 }: {
   fileId: string;
   fileLabel: string;
@@ -341,6 +337,7 @@ function SingleMediaSlot({
   onFiles?: (files: File[]) => void;
   onPaste: (value: string) => void;
   onRemove: () => void;
+  onRetry?: () => void;
 }) {
   const described = [helperId, extraDescribedBy, statusId, overflow ? overflowId : null, error ? errorId : null]
     .filter(Boolean)
@@ -393,7 +390,12 @@ function SingleMediaSlot({
       {ready ? (
         <div className="item-row">
           <p className="mono">{slot.fileName || slot.paste.trim() || slot.url}</p>
-          <p className="hint">{slot.storing ? "Storing…" : "Ready"}</p>
+          <p className="hint">{slot.storing ? "Storing…" : error ? "Failed" : "Ready"}</p>
+          {error && onRetry && slot.pendingFile ? (
+            <button type="button" className="btn" onClick={onRetry} disabled={slot.storing}>
+              Retry
+            </button>
+          ) : null}
           <button type="button" className="btn" onClick={onRemove} disabled={slot.storing}>
             Remove
           </button>
@@ -455,6 +457,7 @@ function MediaListField({
   extraDescribedBy,
   onFiles,
   onRemove,
+  onRetry,
   onPasteChange,
   onPasteAdd,
 }: {
@@ -483,6 +486,7 @@ function MediaListField({
   extraDescribedBy?: string;
   onFiles: (files: File[]) => void;
   onRemove: (key: string) => void;
+  onRetry: (key: string) => void;
   onPasteChange: (value: string) => void;
   onPasteAdd: () => void;
 }) {
@@ -557,7 +561,17 @@ function MediaListField({
                   {itemPrefix} {index + 1} · {item.label}
                 </span>
                 <span className="hint">{item.storing ? "Storing…" : item.error ? "Failed" : "Ready"}</span>
-                <button type="button" className="btn" onClick={() => onRemove(item.key)}>
+                {item.error && item.file ? (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => onRetry(item.key)}
+                    disabled={item.storing}
+                  >
+                    Retry
+                  </button>
+                ) : null}
+                <button type="button" className="btn" onClick={() => onRemove(item.key)} disabled={item.storing}>
                   Remove
                 </button>
                 {item.error ? <p className="field-error">{item.error}</p> : null}
@@ -674,7 +688,6 @@ export function GenerateForm() {
   const storyRef = useRef<StoryWorkbenchHandle | null>(null);
 
   const pollAbort = useRef<AbortController | null>(null);
-  const eventSource = useRef<EventSource | null>(null);
   const imageGen = useRef(0);
   const firstGen = useRef(0);
   const lastGen = useRef(0);
@@ -687,6 +700,35 @@ export function GenerateForm() {
   const frames = framesForDuration(duration, fps, maxFrames);
   const actualSec = frames / fps;
   const maxAtFps = (maxFrames / fps).toFixed(2);
+
+  const promptImages = useMemo((): PromptChipItem[] => {
+    if (model === MODEL_FLASH) {
+      if (flashMode === "reference") return refImageItems;
+      if (flashMode === "keyframe") {
+        const items: PromptChipItem[] = [];
+        if (firstSlot.url || firstSlot.storing) {
+          items.push({ key: "first", url: firstSlot.url, label: "Image1", storing: firstSlot.storing });
+        }
+        if (lastSlot.url || lastSlot.storing) {
+          items.push({
+            key: "last",
+            url: lastSlot.url,
+            label: items.length === 0 ? "Image1" : "Image2",
+            storing: lastSlot.storing,
+          });
+        }
+        return items;
+      }
+      return [];
+    }
+    if (v20Mode === "image") {
+      if (!imageSlot.url && !imageSlot.storing) return [];
+      return [{ key: "image", url: imageSlot.url, label: "Image1", storing: imageSlot.storing }];
+    }
+    if (v20Mode === "keyframes") return keyframeItems;
+    return [];
+  }, [model, flashMode, v20Mode, refImageItems, firstSlot, lastSlot, imageSlot, keyframeItems]);
+  const promptAudios = model === MODEL_FLASH && flashMode === "reference" ? refAudioItems : [];
 
   function changeResolution(next: V20Resolution) {
     setV20Resolution(next);
@@ -701,9 +743,46 @@ export function GenerateForm() {
   useEffect(() => {
     return () => {
       pollAbort.current?.abort();
-      eventSource.current?.close();
     };
   }, []);
+
+  const jobRef = useRef(job);
+  jobRef.current = job;
+  const hydratedJobRef = useRef(false);
+
+  useEffect(() => {
+    if (!hydratedJobRef.current) {
+      hydratedJobRef.current = true;
+      try {
+        const raw = sessionStorage.getItem(GEN_JOB_KEY);
+        if (raw) {
+          const parsed: unknown = JSON.parse(raw);
+          if (typeof parsed === "object" && parsed !== null) {
+            const rec = parsed as Record<string, unknown>;
+            if (typeof rec.videoId === "string" && isModelId(rec.model)) {
+              startJobStream(rec.videoId, rec.model, true);
+              return;
+            }
+          }
+        }
+      } catch {
+        /* ignore quota / private mode */
+      }
+    }
+    try {
+      if (job.phase === "generating") {
+        sessionStorage.setItem(
+          GEN_JOB_KEY,
+          JSON.stringify({ videoId: job.videoId, model: job.model }),
+        );
+      } else {
+        sessionStorage.removeItem(GEN_JOB_KEY);
+      }
+    } catch {
+      /* ignore quota / private mode */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- persist + one-shot restore
+  }, [job]);
 
   const storing =
     imageSlot.storing ||
@@ -717,8 +796,6 @@ export function GenerateForm() {
   function stopJobStream() {
     pollAbort.current?.abort();
     pollAbort.current = null;
-    eventSource.current?.close();
-    eventSource.current = null;
   }
 
   function changeTheme(next: ThemeId) {
@@ -799,6 +876,9 @@ export function GenerateForm() {
       job.phase === "posting" ||
       job.phase === "poll_error";
     if (needsConfirm && !window.confirm("Clear this job and start over?")) return;
+    if (job.phase === "generating") {
+      void abortServerJob(job.videoId, job.model);
+    }
     stopJobStream();
     setModel(MODEL_V20);
     setV20Mode("text");
@@ -851,20 +931,22 @@ export function GenerateForm() {
       paste: "",
       storing: true,
       fileKey: prev.fileKey,
+      pendingFile: file,
     }));
     setErrors((prev) => clearFieldError(prev, errorId));
     void uploadMediaFile(file).then((result) => {
       if (gen !== genRef.current) return;
       if (result.ok) {
-        setSlot((prev) => ({ ...prev, url: result.url, storing: false }));
+        setSlot((prev) => ({ ...prev, url: result.url, storing: false, pendingFile: undefined }));
         return;
       }
       setSlot((prev) => ({
+        ...prev,
         url: "",
-        fileName: "",
+        fileName: file.name,
         paste: "",
         storing: false,
-        fileKey: prev.fileKey + 1,
+        pendingFile: file,
       }));
       setErrors((prev) => ({ ...prev, [errorId]: result.detail }));
     });
@@ -882,6 +964,7 @@ export function GenerateForm() {
       paste: value,
       storing: false,
       fileKey: prev.fileName || prev.storing ? prev.fileKey + 1 : prev.fileKey,
+      pendingFile: undefined,
     }));
   }
 
@@ -903,6 +986,7 @@ export function GenerateForm() {
       url: "",
       label: file.name,
       storing: true,
+      file,
     }));
     setter((prev) => [...prev, ...additions]);
     setErrors((prev) => clearFieldError(prev, errorId));
@@ -912,11 +996,29 @@ export function GenerateForm() {
         setter((prev) =>
           prev.map((row) => {
             if (row.key !== item.key) return row;
-            if (result.ok) return { ...row, url: result.url, storing: false };
-            return { ...row, storing: false, url: "", error: result.detail };
+            if (result.ok) return { ...row, url: result.url, storing: false, error: undefined, file: undefined };
+            return { ...row, storing: false, url: "", error: result.detail, file };
           }),
         );
       });
+    });
+  }
+
+  function retryMediaItem(setter: Dispatch<SetStateAction<MediaItem[]>>, items: MediaItem[], key: string) {
+    const item = items.find((row) => row.key === key);
+    if (!item?.file || item.storing) return;
+    const file = item.file;
+    setter((prev) =>
+      prev.map((row) => (row.key === key ? { ...row, storing: true, error: undefined, url: "" } : row)),
+    );
+    void uploadMediaFile(file).then((result) => {
+      setter((prev) =>
+        prev.map((row) => {
+          if (row.key !== key) return row;
+          if (result.ok) return { ...row, url: result.url, storing: false, error: undefined, file: undefined };
+          return { ...row, storing: false, url: "", error: result.detail, file };
+        }),
+      );
     });
   }
 
@@ -1132,34 +1234,18 @@ export function GenerateForm() {
       setJob(videoId ? { phase: "failed", videoId, message: detail } : { phase: "idle" });
       return;
     }
-    setFormError("Agnes is unavailable or the job was not found.");
+    setFormError(detail);
     if (videoId) {
-      setJob({ phase: "failed", videoId, message: "Agnes is unavailable or the job was not found." });
+      setJob({ phase: "failed", videoId, message: detail });
     } else {
       setJob({ phase: "idle" });
     }
   }
 
-  function startJobStream(videoId: string, pollModel: ModelId) {
+  function startJobStream(videoId: string, pollModel: ModelId, resume = false) {
     stopJobStream();
     const ac = new AbortController();
     pollAbort.current = ac;
-    const params = new URLSearchParams({
-      video_id: videoId,
-      model_name: pollModel,
-    });
-    const es = new EventSource(`/api/videos/events?${params.toString()}`);
-    eventSource.current = es;
-    let settled = false;
-
-    const settle = () => {
-      if (settled) return;
-      settled = true;
-      es.close();
-      if (eventSource.current === es) eventSource.current = null;
-    };
-
-    ac.signal.addEventListener("abort", settle);
 
     setJob({
       phase: "generating",
@@ -1168,128 +1254,61 @@ export function GenerateForm() {
       status: null,
     });
 
-    const failStream = (message: string) => {
-      if (settled || ac.signal.aborted) return;
-      settle();
-      setJob({
-        phase: "poll_error",
-        videoId,
-        model: pollModel,
-        message,
-      });
-    };
+    openJobSse(
+      videoId,
+      pollModel,
+      ac.signal,
+      {
+        onStatus: (status, progress) => {
+          if (ac.signal.aborted) return;
+          setJob({
+            phase: "generating",
+            videoId,
+            model: pollModel,
+            status,
+            progress,
+          });
+        },
+        onCompleted: (url) => {
+          if (ac.signal.aborted) return;
+          setJob({ phase: "completed", videoId, url });
+        },
+        onAuthError: (message) => {
+          if (ac.signal.aborted) return;
+          applyHttpError(401, message, videoId);
+        },
+      },
+      resume,
+    );
+  }
 
-    es.addEventListener("status", (e: MessageEvent) => {
-      if (settled || ac.signal.aborted) return;
-      const data = parseEventPayload(e.data);
-      if (!data || !isJobStatus(data.status)) return;
-      if (data.status !== "queued" && data.status !== "in_progress") return;
-      setJob({
-        phase: "generating",
-        videoId,
-        model: pollModel,
-        status: data.status,
-        progress:
-          typeof data.progress === "number" && Number.isFinite(data.progress)
-            ? data.progress
-            : undefined,
-      });
-    });
-
-    es.addEventListener("completed", (e: MessageEvent) => {
-      if (settled || ac.signal.aborted) return;
-      settle();
-      const data = parseEventPayload(e.data);
-      const url = data && typeof data.url === "string" ? data.url : null;
-      setJob({ phase: "completed", videoId, url });
-    });
-
-    es.addEventListener("failed", (e: MessageEvent) => {
-      if (settled || ac.signal.aborted) return;
-      settle();
-      const data = parseEventPayload(e.data);
-      const message =
-        data && typeof data.message === "string" && data.message.length > 0
-          ? data.message
-          : "Generation failed.";
-      setJob({ phase: "failed", videoId, message });
-    });
-
-    es.addEventListener("timeout", (e: MessageEvent) => {
-      if (settled || ac.signal.aborted) return;
-      settle();
-      const data = parseEventPayload(e.data);
-      setJob({
-        phase: "timeout",
-        videoId,
-        model: pollModel,
-        status: data && isJobStatus(data.status) ? data.status : undefined,
-      });
-    });
-
-    es.addEventListener("stream_error", (e: MessageEvent) => {
-      if (settled || ac.signal.aborted) return;
-      const data = parseEventPayload(e.data);
-      failStream(
-        data && typeof data.message === "string" && data.message.length > 0
-          ? data.message
-          : "Status check failed. You can check status.",
-      );
-    });
-
-    es.addEventListener("error", () => {
-      if (settled || ac.signal.aborted) return;
-      failStream("Status check failed. You can check status.");
+  function abortGenerating() {
+    const current = jobRef.current;
+    if (current.phase !== "generating") return;
+    void abortServerJob(current.videoId, current.model);
+    stopJobStream();
+    setJob({
+      phase: "poll_error",
+      videoId: current.videoId,
+      model: current.model,
+      message: "Stopped.",
     });
   }
 
   async function pollOnce(videoId: string, pollModel: ModelId) {
-    const ac = new AbortController();
-    pollAbort.current = ac;
     try {
-      const result = await fetchStatus(videoId, pollModel, ac.signal);
-      if (result.ok) {
-        const st = result.data.status;
-        if (st === "completed") {
-          setJob({ phase: "completed", videoId, url: result.data.metadata?.url ?? null });
-          return;
-        }
-        if (st === "failed") {
-          setJob({
-            phase: "failed",
-            videoId,
-            message: result.data.error?.message ?? "Generation failed.",
-          });
-          return;
-        }
-        setJob({
-          phase: "timeout",
-          videoId,
-          model: pollModel,
-          status: st,
-          progress: result.data.progress,
-        });
+      const result = await fetchStatus(videoId, pollModel, new AbortController().signal);
+      if (result.ok && result.data.status === "completed") {
+        setJob({ phase: "completed", videoId, url: result.data.metadata?.url ?? null });
         return;
       }
-      if (result.kind === "http") {
+      if (!result.ok && result.kind === "http" && result.status === 401) {
         applyHttpError(result.status, result.detail, videoId);
         return;
       }
-      setJob({
-        phase: "poll_error",
-        videoId,
-        model: pollModel,
-        message: "Status check failed. You can check status.",
-      });
+      startJobStream(videoId, pollModel, true);
     } catch (err) {
-      if (!isAbort(err)) {
-        setJob({
-          phase: "poll_error",
-          videoId,
-          model: pollModel,
-          message: "Status check failed. You can check status.",
-        });
-      }
+      if (!isAbort(err)) startJobStream(videoId, pollModel, true);
     }
   }
 
@@ -1526,37 +1545,34 @@ export function GenerateForm() {
           )}
 
           <div className="row">
-            <label className="field" htmlFor="prompt">
+            <label className="field" htmlFor="prompt" id="prompt-label">
               Prompt{" "}
               <abbr className="req" title="required">
                 *
               </abbr>
             </label>
-            <textarea
+            <PromptComposer
               id="prompt"
-              name="prompt"
-              rows={5}
-              required
-              aria-required="true"
-              aria-invalid={errors.prompt ? true : undefined}
-              aria-describedby={
-                [errors.prompt ? "prompt-error" : null, model === MODEL_FLASH && flashMode === "reference" ? "ref-helper" : null]
-                  .filter(Boolean)
-                  .join(" ") || undefined
+              labelledBy="prompt-label"
+              describedBy={
+                [errors.prompt ? "prompt-error" : null, "prompt-helper"].filter(Boolean).join(" ") || undefined
               }
+              invalid={Boolean(errors.prompt)}
+              required
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              images={promptImages}
+              audios={promptAudios}
+              onChange={setPrompt}
             />
             {errors.prompt ? (
               <p className="field-error" id="prompt-error">
                 {errors.prompt}
               </p>
             ) : null}
-            {model === MODEL_FLASH && flashMode === "reference" ? (
-              <p className="hint" id="ref-helper">
-                Name each input in the prompt, in order: {"<Picture 1>"}, {"<Picture 2>"}, {"<Audio 1>"}, …
-              </p>
-            ) : null}
+            <p className="hint" id="prompt-helper">
+              Type @ to mention a ready image or audio as Image1 / Audio1. You can also click a chip.
+              Agnes still receives {"<Picture 1>"} / {"<Audio 1>"} in list order.
+            </p>
           </div>
 
           {model === MODEL_V20 ? (
@@ -1654,6 +1670,11 @@ export function GenerateForm() {
                       setImageOverflow(undefined);
                       setErrors((prev) => clearFieldError(prev, "image-file"));
                     }}
+                    onRetry={() => {
+                      if (imageSlot.pendingFile) {
+                        applySingleFile(imageGen, setImageSlot, "image-file", imageSlot.pendingFile);
+                      }
+                    }}
                   />
                 </fieldset>
               ) : null}
@@ -1695,6 +1716,7 @@ export function GenerateForm() {
                     setKeyframeItems((prev) => prev.filter((item) => item.key !== key));
                     setKfOverflow(undefined);
                   }}
+                  onRetry={(key) => retryMediaItem(setKeyframeItems, keyframeItems, key)}
                   onPasteChange={setKfPaste}
                   onPasteAdd={() => {
                     if (keyframeItems.length >= V20_KEYFRAME_MAX) {
@@ -1838,6 +1860,11 @@ export function GenerateForm() {
                       setFirstOverflow(undefined);
                       setErrors((prev) => clearFieldError(prev, "first-file"));
                     }}
+                    onRetry={() => {
+                      if (firstSlot.pendingFile) {
+                        applySingleFile(firstGen, setFirstSlot, "first-file", firstSlot.pendingFile);
+                      }
+                    }}
                   />
                   <SingleMediaSlot
                     fileId="last-file"
@@ -1869,6 +1896,11 @@ export function GenerateForm() {
                       clearSingle(lastGen, setLastSlot);
                       setLastOverflow(undefined);
                       setErrors((prev) => clearFieldError(prev, "last-file"));
+                    }}
+                    onRetry={() => {
+                      if (lastSlot.pendingFile) {
+                        applySingleFile(lastGen, setLastSlot, "last-file", lastSlot.pendingFile);
+                      }
                     }}
                   />
                 </fieldset>
@@ -1908,6 +1940,7 @@ export function GenerateForm() {
                       setRefImageItems((prev) => prev.filter((item) => item.key !== key));
                       setRefImgOverflow(undefined);
                     }}
+                    onRetry={(key) => retryMediaItem(setRefImageItems, refImageItems, key)}
                     onPasteChange={setRefImgPaste}
                     onPasteAdd={() => {
                       if (refImageItems.length >= FLASH_IMAGE_MAX) {
@@ -1949,6 +1982,7 @@ export function GenerateForm() {
                       setRefAudioItems((prev) => prev.filter((item) => item.key !== key));
                       setRefAudOverflow(undefined);
                     }}
+                    onRetry={(key) => retryMediaItem(setRefAudioItems, refAudioItems, key)}
                     onPasteChange={setRefAudPaste}
                     onPasteAdd={() => {
                       if (refAudioItems.length >= FLASH_AUDIO_MAX) {
@@ -1994,8 +2028,9 @@ export function GenerateForm() {
             void pollOnce(videoId, pollModel);
           }}
           onPollAgain={(videoId, pollModel) => {
-            startJobStream(videoId, pollModel);
+            startJobStream(videoId, pollModel, true);
           }}
+          onAbort={abortGenerating}
         />
       </div>
 
@@ -2014,10 +2049,12 @@ function JobPane({
   job,
   onCheckStatus,
   onPollAgain,
+  onAbort,
 }: {
   job: JobView;
   onCheckStatus: (videoId: string, model: ModelId) => void;
   onPollAgain: (videoId: string, model: ModelId) => void;
+  onAbort: () => void;
 }) {
   const live = liveStatus(job);
   const busyWell = job.phase === "posting" || job.phase === "generating";
@@ -2040,7 +2077,12 @@ function JobPane({
             {live}
           </p>
         )}
-        <JobBody job={job} onCheckStatus={onCheckStatus} onPollAgain={onPollAgain} />
+        <JobBody
+          job={job}
+          onCheckStatus={onCheckStatus}
+          onPollAgain={onPollAgain}
+          onAbort={onAbort}
+        />
       </div>
     </aside>
   );
@@ -2064,7 +2106,7 @@ function liveStatus(job: JobView): string {
     case "timeout":
       return "Still generating?";
     case "poll_error":
-      return "Status check failed.";
+      return job.message || "Stopped.";
     default: {
       const _e: never = job;
       return _e;
@@ -2087,10 +2129,12 @@ function JobBody({
   job,
   onCheckStatus,
   onPollAgain,
+  onAbort,
 }: {
   job: JobView;
   onCheckStatus: (videoId: string, model: ModelId) => void;
   onPollAgain: (videoId: string, model: ModelId) => void;
+  onAbort: () => void;
 }) {
   if (job.phase === "idle") {
     return <p className="hint">Fill the form, then Generate. This pane becomes status, then a player.</p>;
@@ -2099,7 +2143,16 @@ function JobBody({
     return null;
   }
   if (job.phase === "generating") {
-    return <p className="mono">video_id: {job.videoId}</p>;
+    return (
+      <>
+        <p className="mono">video_id: {job.videoId}</p>
+        <p>
+          <button type="button" className="btn" onClick={onAbort}>
+            Abort
+          </button>
+        </p>
+      </>
+    );
   }
   if (job.phase === "completed") {
     return (

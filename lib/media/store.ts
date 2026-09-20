@@ -1,15 +1,10 @@
 import "server-only";
 
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
-import path from "node:path";
-
-import { del, get, list, put } from "@vercel/blob";
+import { AwsClient } from "aws4fetch";
 
 import { isPublicHttpsUrl } from "@/lib/agnes/types";
 
 export const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
-/** Local upload bytes + meta are deleted this long after last write. */
-export const UPLOAD_TTL_MS = 60 * 60 * 1000;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -43,33 +38,63 @@ const EXT_MIME: Record<string, string> = {
   aac: "audio/aac",
 };
 
-type Meta = { contentType: string; filename: string; url?: string };
-
 export type StoredUpload = { id: string; url: string };
 
-function blobToken(): string | undefined {
-  const t = process.env.BLOB_READ_WRITE_TOKEN?.trim();
-  return t || undefined;
+export type R2Folder = "uploads" | "generated";
+
+type R2Config = {
+  client: AwsClient;
+  bucket: string;
+  endpoint: string;
+  publicBase: string;
+};
+
+const R2_MISSING =
+  "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, and R2_PUBLIC_BASE_URL in .env, then restart.";
+
+function trimEnv(name: string): string {
+  return (process.env[name] ?? "").trim();
 }
 
-function useBlobStore(): boolean {
-  return Boolean(blobToken()) || Boolean(process.env.VERCEL);
-}
-
-function blobPath(id: string): string {
-  return `agnes/${id}`;
-}
-
-function blobOpts(): { token?: string } {
-  const token = blobToken();
-  return token ? { token } : {};
-}
-
-function uploadsDir(): string {
-  if (process.env.VERCEL) {
-    return path.join("/tmp", "agnes-uploads");
+function r2Config(): R2Config {
+  const accessKeyId = trimEnv("R2_ACCESS_KEY_ID");
+  const secretAccessKey = trimEnv("R2_SECRET_ACCESS_KEY");
+  const bucket = trimEnv("R2_BUCKET");
+  const publicBase = trimEnv("R2_PUBLIC_BASE_URL").replace(/\/+$/, "");
+  const accountId = trimEnv("R2_ACCOUNT_ID");
+  const endpoint = (
+    trimEnv("R2_ENDPOINT") ||
+    (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : "")
+  ).replace(/\/+$/, "");
+  if (!accessKeyId || !secretAccessKey || !bucket || !publicBase || !endpoint) {
+    throw new Error(R2_MISSING);
   }
-  return path.join(process.cwd(), ".data", "uploads");
+  if (!isPublicHttpsUrl(publicBase)) {
+    throw new Error("R2_PUBLIC_BASE_URL must be a public https:// URL (the r2.dev or custom domain).");
+  }
+  return {
+    client: new AwsClient({
+      accessKeyId,
+      secretAccessKey,
+      service: "s3",
+      region: "auto",
+    }),
+    bucket,
+    endpoint,
+    publicBase,
+  };
+}
+
+function objectKey(folder: R2Folder | "agnes", id: string): string {
+  return `${folder}/${id}`;
+}
+
+function publicUrlFor(cfg: R2Config, folder: R2Folder | "agnes", id: string): string {
+  return `${cfg.publicBase}/${objectKey(folder, id)}`;
+}
+
+function objectUrl(cfg: R2Config, key: string): string {
+  return `${cfg.endpoint}/${cfg.bucket}/${key.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 function extOf(name: string): string {
@@ -78,100 +103,8 @@ function extOf(name: string): string {
   return i >= 0 ? base.slice(i + 1).toLowerCase() : "";
 }
 
-function safeFilename(name: string): string {
-  const base = name.replace(/\\/g, "/").split("/").pop() ?? "file";
-  const cleaned = base.replace(/[^\w.\- ()[\]]+/g, "_").slice(0, 200);
-  return cleaned.length > 0 ? cleaned : "file";
-}
-
 function isMediaId(id: string): boolean {
   return UUID_RE.test(id);
-}
-
-function mediaIdFromName(name: string): string | null {
-  const id = name.endsWith(".json") ? name.slice(0, -5) : name;
-  return isMediaId(id) ? id : null;
-}
-
-let sweepInFlight: Promise<void> | null = null;
-
-/** Delete UUID uploads (file + `.json`) whose mtime is older than `UPLOAD_TTL_MS`. */
-export async function purgeExpiredUploads(): Promise<void> {
-  if (!sweepInFlight) {
-    sweepInFlight = runPurge().finally(() => {
-      sweepInFlight = null;
-    });
-  }
-  try {
-    await sweepInFlight;
-  } catch {
-    /* sweep must not break upload or generate */
-  }
-}
-
-async function runPurge(): Promise<void> {
-  if (useBlobStore()) {
-    await runPurgeBlob();
-    return;
-  }
-  const dir = uploadsDir();
-  let names: string[];
-  try {
-    names = await readdir(/* turbopackIgnore: true */ dir);
-  } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return;
-    throw err;
-  }
-
-  const ids = new Set<string>();
-  for (const name of names) {
-    const id = mediaIdFromName(name);
-    if (id) ids.add(id);
-  }
-
-  const cutoff = Date.now() - UPLOAD_TTL_MS;
-  await Promise.all(
-    [...ids].map(async (id) => {
-      const filePath = resolveUploadPath(id);
-      if (!filePath) return;
-      const metaPath = `${filePath}.json`;
-      let newest = 0;
-      for (const p of [filePath, metaPath]) {
-        try {
-          const st = await stat(/* turbopackIgnore: true */ p);
-          newest = Math.max(newest, st.mtimeMs);
-        } catch {
-          /* missing half of a pair */
-        }
-      }
-      if (newest === 0 || newest > cutoff) return;
-      await unlink(filePath).catch(() => undefined);
-      await unlink(metaPath).catch(() => undefined);
-    }),
-  );
-}
-
-async function runPurgeBlob(): Promise<void> {
-  const cutoff = Date.now() - UPLOAD_TTL_MS;
-  let cursor: string | undefined;
-  const opts = blobOpts();
-  do {
-    const page = await list({ prefix: "agnes/", cursor, limit: 100, ...opts });
-    const stale = page.blobs
-      .filter((b) => new Date(b.uploadedAt).getTime() < cutoff)
-      .map((b) => b.url);
-    if (stale.length > 0) await del(stale, opts);
-    cursor = page.hasMore ? page.cursor : undefined;
-  } while (cursor);
-}
-
-function resolveUploadPath(id: string): string | null {
-  if (!isMediaId(id)) return null;
-  const root = uploadsDir();
-  const filePath = path.join(root, id);
-  const rel = path.relative(root, filePath);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  return filePath;
 }
 
 export function getPublicAppOrigin(): { ok: true; origin: string } | { ok: false; detail: string } {
@@ -223,42 +156,38 @@ export function classifyUpload(
   };
 }
 
+function asciiMeta(value: string, max = 180): string {
+  const cleaned = value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return (cleaned || "file").slice(0, max);
+}
+
 export async function saveUpload(
   bytes: Uint8Array,
   contentType: string,
   filename: string,
+  folder: R2Folder,
 ): Promise<StoredUpload> {
-  await purgeExpiredUploads();
+  const cfg = r2Config();
   const id = crypto.randomUUID();
-  if (useBlobStore()) {
-    try {
-      const blob = await put(blobPath(id), Buffer.from(bytes), {
-        access: "public",
-        addRandomSuffix: false,
-        contentType,
-        cacheControlMaxAge: Math.max(60, Math.floor(UPLOAD_TTL_MS / 1000)),
-        ...blobOpts(),
-      });
-      return { id, url: blob.url };
-    } catch {
-      throw new Error("Connect a Vercel Blob store so images persist in production.");
-    }
+  const key = objectKey(folder, id);
+  const createdAt = new Date().toISOString();
+  const body = Buffer.from(bytes);
+  const res = await cfg.client.fetch(objectUrl(cfg, key), {
+    method: "PUT",
+    body,
+    headers: {
+      "Content-Type": contentType,
+      "Content-Length": String(body.byteLength),
+      "Cache-Control": "public, max-age=3600",
+      "x-amz-meta-folder": folder,
+      "x-amz-meta-created-at": createdAt,
+      "x-amz-meta-filename": asciiMeta(filename),
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Could not store this file on Cloudflare R2 (${res.status}).`);
   }
-  const dir = uploadsDir();
-  await mkdir(/* turbopackIgnore: true */ dir, { recursive: true });
-  const filePath = resolveUploadPath(id);
-  if (!filePath) throw new Error("Could not store this file.");
-  const metaPath = `${filePath}.json`;
-  const meta: Meta = { contentType, filename: safeFilename(filename) };
-  try {
-    await writeFile(filePath, bytes);
-    await writeFile(metaPath, JSON.stringify(meta));
-  } catch (err) {
-    await unlink(filePath).catch(() => undefined);
-    await unlink(metaPath).catch(() => undefined);
-    throw err;
-  }
-  return { id, url: `agnes-media:${id}` };
+  return { id, url: publicUrlFor(cfg, folder, id) };
 }
 
 export function isAgnesMediaRef(value: string): boolean {
@@ -267,61 +196,56 @@ export function isAgnesMediaRef(value: string): boolean {
 }
 
 export async function resolveAgnesMediaUrl(ref: string): Promise<string> {
+  if (isPublicHttpsUrl(ref)) return ref;
   if (!isAgnesMediaRef(ref)) {
     throw new Error("File is gone. Upload again.");
   }
   const id = ref.slice("agnes-media:".length);
   const stored = await readUpload(id);
-  if (!stored) {
+  if (!stored?.publicUrl || !isPublicHttpsUrl(stored.publicUrl)) {
     throw new Error("File is gone. Upload again.");
   }
-  if (stored.publicUrl && isPublicHttpsUrl(stored.publicUrl)) return stored.publicUrl;
-  return `data:${stored.contentType};base64,${stored.bytes.toString("base64")}`;
+  return stored.publicUrl;
 }
 
 export async function readUpload(
   id: string,
 ): Promise<{ bytes: Buffer; contentType: string; publicUrl?: string } | null> {
-  if (useBlobStore()) {
-    return readBlob(id);
-  }
-  await purgeExpiredUploads();
-  const filePath = resolveUploadPath(id);
-  if (!filePath) return null;
+  if (!isMediaId(id)) return null;
+  let cfg: R2Config;
   try {
-    const [bytes, metaRaw] = await Promise.all([
-      readFile(filePath),
-      readFile(`${filePath}.json`, "utf8"),
-    ]);
-    const parsed: unknown = JSON.parse(metaRaw);
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      typeof (parsed as Meta).contentType !== "string" ||
-      (parsed as Meta).contentType.length === 0
-    ) {
-      return null;
-    }
-    return { bytes, contentType: (parsed as Meta).contentType };
+    cfg = r2Config();
   } catch {
     return null;
   }
+  const folders: Array<R2Folder | "agnes"> = ["uploads", "generated", "agnes"];
+  for (const folder of folders) {
+    const res = await cfg.client.fetch(objectUrl(cfg, objectKey(folder, id)), { method: "HEAD" });
+    if (!res.ok) continue;
+    const contentType = res.headers.get("content-type") || "application/octet-stream";
+    return { bytes: Buffer.alloc(0), contentType, publicUrl: publicUrlFor(cfg, folder, id) };
+  }
+  return null;
 }
 
-async function readBlob(
+export async function readUploadBytes(
   id: string,
 ): Promise<{ bytes: Buffer; contentType: string; publicUrl?: string } | null> {
   if (!isMediaId(id)) return null;
+  let cfg: R2Config;
   try {
-    const result = await get(blobPath(id), { access: "public", ...blobOpts() });
-    if (!result || result.statusCode !== 200) return null;
-    const bytes = Buffer.from(await new Response(result.stream).arrayBuffer());
-    return {
-      bytes,
-      contentType: result.blob.contentType || "application/octet-stream",
-      publicUrl: result.blob.url,
-    };
+    cfg = r2Config();
   } catch {
     return null;
   }
+  const folders: Array<R2Folder | "agnes"> = ["uploads", "generated", "agnes"];
+  for (const folder of folders) {
+    const res = await cfg.client.fetch(objectUrl(cfg, objectKey(folder, id)), { method: "GET" });
+    if (!res.ok) continue;
+    const contentType = res.headers.get("content-type") || "application/octet-stream";
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length === 0) continue;
+    return { bytes, contentType, publicUrl: publicUrlFor(cfg, folder, id) };
+  }
+  return null;
 }

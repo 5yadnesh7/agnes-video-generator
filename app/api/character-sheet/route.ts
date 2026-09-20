@@ -1,9 +1,6 @@
 import {
-  cookieApiKey,
-  envApiKey,
-  overrideFromBody,
-  setOverrideCookie,
-  clearOverrideCookie,
+  envStoryKey,
+  missingStoryKeyCopy,
 } from "@/lib/agnes/api-key";
 import { DEFAULT_IMAGE_MODEL, isImageModelId } from "@/lib/agnes/constants";
 import { characterModelSheetPrompt } from "@/lib/agnes/storyboard";
@@ -21,10 +18,8 @@ function jsonError(status: number, detail: string): Response {
   return Response.json({ detail }, { status });
 }
 
-function withKeyCookie(res: Response, override: string | null): Response {
-  const headers = new Headers(res.headers);
-  headers.set("Set-Cookie", override ? setOverrideCookie(override) : clearOverrideCookie());
-  return new Response(res.body, { status: res.status, headers });
+function withKeyCookie(res: Response, _override: string | null): Response {
+  return res;
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -36,8 +31,9 @@ export async function POST(request: Request): Promise<Response> {
   }
   if (!isRecord(json)) return jsonError(400, "Invalid JSON.");
 
-  const override = overrideFromBody(json.agnes_api_key);
-  const key = override ?? cookieApiKey(request) ?? envApiKey();
+  const key = envStoryKey();
+  if (!key) return jsonError(401, missingStoryKeyCopy());
+  const override = null;
 
   const appearance = typeof json.appearance === "string" ? json.appearance.trim() : "";
   const style = typeof json.style === "string" ? json.style.trim() : "";
@@ -73,7 +69,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   try {
-    const stored = await saveUpload(new Uint8Array(image.bytes), image.contentType, "character-sheet.png");
+    const stored = await saveUpload(new Uint8Array(image.bytes), image.contentType, "character-sheet.png", "generated");
     return withKeyCookie(Response.json({ id: stored.id, url: stored.url }), override);
   } catch (err) {
     const detail = err instanceof Error ? err.message : "Could not store this file.";

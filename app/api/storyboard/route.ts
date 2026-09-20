@@ -1,9 +1,6 @@
 import {
-  cookieApiKey,
-  envApiKey,
-  overrideFromBody,
-  setOverrideCookie,
-  clearOverrideCookie,
+  envStoryKey,
+  missingStoryKeyCopy,
 } from "@/lib/agnes/api-key";
 import {
   DEFAULT_FRAME_RATE,
@@ -39,7 +36,9 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const TEXT_MAX = 12_000;
-const CONTINUE_MAX = 5;
+const CONTINUE_MAX = 1;
+const STORYBOARD_CHAT_MS = 70_000;
+const STORYBOARD_CONTINUE_MS = 40_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -49,10 +48,8 @@ function jsonError(status: number, detail: string): Response {
   return Response.json({ detail }, { status });
 }
 
-function withKeyCookie(res: Response, override: string | null): Response {
-  const headers = new Headers(res.headers);
-  headers.set("Set-Cookie", override ? setOverrideCookie(override) : clearOverrideCookie());
-  return new Response(res.body, { status: res.status, headers });
+function withKeyCookie(res: Response, _override: string | null): Response {
+  return res;
 }
 
 type CharacterOut = {
@@ -198,8 +195,8 @@ function trimToBudget(
   return out;
 }
 
-function chatTimeoutMs(sceneGuess: number): number {
-  return Math.min(180_000, 90_000 + sceneGuess * 1_500);
+function chatTimeoutMs(_sceneGuess: number): number {
+  return STORYBOARD_CHAT_MS;
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -211,8 +208,9 @@ export async function POST(request: Request): Promise<Response> {
   }
   if (!isRecord(json)) return jsonError(400, "Invalid JSON.");
 
-  const override = overrideFromBody(json.agnes_api_key);
-  const key = override ?? cookieApiKey(request) ?? envApiKey();
+  const key = envStoryKey();
+  if (!key) return jsonError(401, missingStoryKeyCopy());
+  const override = null;
 
   const source = json.source;
   if (source !== "topic" && source !== "story") {
@@ -301,7 +299,12 @@ export async function POST(request: Request): Promise<Response> {
 
   let scenes = shapeScenes(parsed.scenes, videoModel, names, fps, maxFrames) ?? [];
   let continues = 0;
-  while (scenesTotal(scenes) < budget * 0.85 && scenes.length < STORY_SCENE_HARD_MAX && continues < CONTINUE_MAX) {
+  while (
+    scenesTotal(scenes) < budget * 0.85 &&
+    scenes.length < STORY_SCENE_HARD_MAX &&
+    scenes.length < range.max &&
+    continues < CONTINUE_MAX
+  ) {
     continues += 1;
     const remaining = Math.max(1, budget - scenesTotal(scenes));
     const more = await chatCompletion(
@@ -314,11 +317,11 @@ export async function POST(request: Request): Promise<Response> {
         maxFrames,
       ),
       key,
-      timeoutMs,
+      STORYBOARD_CONTINUE_MS,
     );
     if (!more.ok) {
-      console.info("storyboard: continue failed");
-      return withKeyCookie(jsonError(more.status, more.detail), override);
+      console.info("storyboard: continue skipped");
+      break;
     }
     let extraParsed: unknown;
     try {

@@ -39,7 +39,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   try {
-    const stored = await saveUpload(bytes, classified.contentType, file.name);
+    const stored = await saveUpload(bytes, classified.contentType, file.name, "uploads");
     const origin = getPublicAppOrigin();
     const url = isPublicHttpsUrl(stored.url)
       ? stored.url
@@ -47,7 +47,11 @@ export async function POST(request: Request): Promise<Response> {
         ? `${origin.origin}/api/media/${stored.id}`
         : stored.url;
     return Response.json({ id: stored.id, url });
-  } catch {
-    return jsonError(502, "Could not store this file. Try again, or paste a public https:// URL.");
+  } catch (err) {
+    const detail =
+      err instanceof Error && err.message.startsWith("Could not store")
+        ? err.message
+        : "Could not store this file on Cloudflare R2. Check R2 env vars and retry.";
+    return jsonError(502, detail);
   }
 }

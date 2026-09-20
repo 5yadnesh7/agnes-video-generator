@@ -1,14 +1,14 @@
 import { MODEL_V20 } from "@/lib/agnes/constants";
 import {
   clearOverrideCookie,
-  envApiKey,
+  envVideoKey,
   overrideFromBody,
   setOverrideCookie,
 } from "@/lib/agnes/api-key";
 import { buildCreateBody, parseCreateRequest } from "@/lib/agnes/payloads";
 import { createVideo } from "@/lib/agnes/upstream";
 import type { CreateRequest } from "@/lib/agnes/types";
-import { isAgnesMediaRef, purgeExpiredUploads, resolveAgnesMediaUrl } from "@/lib/media/store";
+import { isAgnesMediaRef, resolveAgnesMediaUrl } from "@/lib/media/store";
 
 export const maxDuration = 30;
 
@@ -44,14 +44,12 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const override = isRecord(json) ? overrideFromBody(json.agnes_api_key) : null;
-  const key = override ?? envApiKey();
+  const key = override ?? envVideoKey();
 
   const parsed = parseCreateRequest(json);
   if (!parsed.ok) {
     return Response.json({ detail: parsed.detail }, { status: 400 });
   }
-
-  await purgeExpiredUploads();
 
   try {
     await resolveRequestMedia(parsed.value);
