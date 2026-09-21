@@ -12,23 +12,26 @@ import {
 } from "react";
 
 import {
-  allowedV20Durations,
   DEFAULT_FRAME_RATE,
   DEFAULT_IMAGE_MODEL,
   DEFAULT_V20_RESOLUTION,
-  IMAGE_MODELS,
-  isImageModelId,
   FLASH_ASPECT_RATIOS,
   FLASH_AUDIO_MAX,
   FLASH_IMAGE_MAX,
+  FLASH_STORY_DURATION_OPTIONS,
   FLASH_STORY_SECONDS,
   formatStoryLength,
-  framesForDuration,
+  IMAGE_MODELS,
+  isImageModelId,
   maxFramesForPixels,
   MODEL_FLASH,
   MODEL_V20,
   snapStoryDuration,
+  STORY_BOARD_AUDIO_MAX,
+  STORY_BOARD_IMAGE_MAX,
   STORY_CHARACTER_MAX,
+  STORY_COMPOSE_AUDIO_MAX,
+  STORY_COMPOSE_IMAGE_MAX,
   STORY_CREATE_GAP_MS,
   STORY_DEFAULT_MINUTES,
   STORY_MINUTES_OPTIONS,
@@ -36,10 +39,8 @@ import {
   STORY_SCENE_MIN,
   STORY_V20_NEGATIVE_PROMPT,
   clampStoryMinutes,
-  storyClipMinSec,
-  storyClipTargetSec,
-  storySceneRange,
-  storyTiming,
+  flashStorySceneCount,
+  framesForDuration,
   V20_ASPECTS,
   V20_FPS_OPTIONS,
   V20_I2V_MAX,
@@ -51,7 +52,7 @@ import {
   type V20Fps,
   type V20Resolution,
 } from "@/lib/agnes/constants";
-import { FLASH_STORY_NEGATIVE_LINE, formatStoryShot, isComposedShotPrompt, isComposedStillPrompt, applyShotDurationLine, sceneBridgeStillPrompt, sceneStartStillPrompt, sceneTimeRange, sceneUsesSheetI2V, sceneNeedsGeneratedStart } from "@/lib/agnes/story-format";
+import { FLASH_STORY_NEGATIVE_LINE, formatStoryShot, isComposedShotPrompt, isComposedStillPrompt, applyShotDurationLine, sceneBridgeStillPrompt, sceneStartStillPrompt, sceneTimeRange, sceneUsesSheetI2V, sceneIsI2V, sceneNeedsGeneratedStart, isShotMode, dialogueTurnsFromUnknown, serializeDialogueJson, normalizeDialogueJson, type DialogueTurn, type ShotMode } from "@/lib/agnes/story-format";
 import {
   isPublicHttpsUrl,
   type CreateRequest,
@@ -61,18 +62,22 @@ import {
 } from "@/lib/agnes/types";
 import { ClipTimeline } from "@/components/clip-timeline";
 import { PromptComposer, type PromptChipItem } from "@/components/prompt-media-chips";
-import { humanizeAgnesDetail } from "@/lib/agnes/errors";
+import { humanizeAgnesDetail, isAgnesCreateQueueFull } from "@/lib/agnes/errors";
 import { abortServerJob, openJobSse } from "@/lib/client/job-sse";
+import { localMediaUrl } from "@/lib/client/media-cache";
 
 const IMAGE_ACCEPT = ".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp";
 const AUDIO_ACCEPT = "audio/mpeg,audio/wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.aac,.mp4";
-const STORY_IMAGE_LIBRARY_MAX = 8;
-const STORY_AUDIO_LIBRARY_MAX = 6;
+/** Wait from a CREATE queue-full reject; do not add STORY_CREATE_GAP_MS on top. */
+const STORY_CREATE_QUEUE_FULL_WAIT_MS = 60_000;
+const STORY_CREATE_QUEUE_FULL_ATTEMPTS = 3;
 const PIPELINE = ["input", "storyboard", "clips", "merge"] as const;
 type Gate = "input" | "storyboard" | "clips";
 type PipelineStep = (typeof PIPELINE)[number];
 type SourceMode = "topic" | "story";
 type ClipStatus = "waiting" | "queued" | "generating" | "ready" | "failed";
+
+type StillRef = { id: string; url: string; prompt?: string };
 
 type SceneDraft = {
   title: string;
@@ -93,6 +98,9 @@ type SceneDraft = {
   bridgeUrl: string;
   startId: string;
   startUrl: string;
+  imageModel: ImageModelId;
+  shotMode: ShotMode;
+  i2vRefs: StillRef[];
 };
 
 type CharacterDraft = {
@@ -136,6 +144,8 @@ type Clip = {
 const STORY_CHECKPOINT_KEY = "agnes-story-checkpoint-v2";
 
 type ImageKind = "character" | "keyframe";
+type StudioMode = "compose" | "board" | "playback";
+type BeatFocus = "wait" | "cast" | "scene";
 
 type StoryImageAsset = {
   key: string;
@@ -145,6 +155,7 @@ type StoryImageAsset = {
   selected: boolean;
   kind: ImageKind;
   characterName: string;
+  sceneIndex: number | null;
 };
 
 type StoryAudioAsset = {
@@ -242,8 +253,14 @@ function parseImageAssets(raw: unknown, fallback?: { url: string; id: string; na
         selected: rec.selected !== false,
         kind: rec.kind === "keyframe" ? "keyframe" : "character",
         characterName: typeof rec.characterName === "string" ? rec.characterName : "",
+        sceneIndex:
+          rec.sceneIndex === null || rec.sceneIndex === undefined
+            ? null
+            : typeof rec.sceneIndex === "number" && Number.isInteger(rec.sceneIndex) && rec.sceneIndex >= 0
+              ? rec.sceneIndex
+              : null,
       });
-      if (out.length >= STORY_IMAGE_LIBRARY_MAX) break;
+      if (out.length >= STORY_BOARD_IMAGE_MAX) break;
     }
   }
   if (out.length === 0 && fallback?.url) {
@@ -255,6 +272,7 @@ function parseImageAssets(raw: unknown, fallback?: { url: string; id: string; na
       selected: true,
       kind: "character",
       characterName: "",
+      sceneIndex: null,
     });
   }
   return out;
@@ -283,7 +301,7 @@ function parseAudioAssets(raw: unknown): StoryAudioAsset[] {
       selected: rec.selected !== false,
       sceneIndex,
     });
-    if (out.length >= STORY_AUDIO_LIBRARY_MAX) break;
+    if (out.length >= STORY_BOARD_AUDIO_MAX) break;
   }
   return out;
 }
@@ -337,8 +355,10 @@ function bindAssetsToCharacters(
   return { chars: nextChars, images: nextImages };
 }
 
-function selectedImageUrls(images: StoryImageAsset[]): string[] {
-  return images.filter((img) => img.selected).map((img) => img.url);
+function selectedImageUrls(images: StoryImageAsset[], sceneIndex: number): string[] {
+  return images
+    .filter((img) => img.selected && (img.sceneIndex === null || img.sceneIndex === sceneIndex))
+    .map((img) => img.url);
 }
 
 function selectedAudioUrls(audios: StoryAudioAsset[], sceneIndex: number): string[] {
@@ -468,10 +488,47 @@ function shotReady(scene: SceneDraft): boolean {
 }
 
 function mediaPreview(id: string, url: string): string {
-  if (isPublicHttpsUrl(url)) return url;
   if (url.startsWith("agnes-media:")) return `/api/media/${url.slice("agnes-media:".length)}`;
   if (id) return `/api/media/${id}`;
+  if (isPublicHttpsUrl(url)) return url;
   return url;
+}
+
+function StoryCachedImg({
+  src,
+  alt,
+  className,
+}: {
+  src: string;
+  alt?: string;
+  className?: string;
+}) {
+  const [href, setHref] = useState("");
+  const [loadedSrc, setLoadedSrc] = useState("");
+  useEffect(() => {
+    if (!src) return;
+    let live = true;
+    let blobUrl = "";
+    void localMediaUrl(src).then((next) => {
+      if (!live) {
+        if (next.startsWith("blob:")) URL.revokeObjectURL(next);
+        return;
+      }
+      blobUrl = next.startsWith("blob:") ? next : "";
+      setHref(next);
+      setLoadedSrc(src);
+    });
+    return () => {
+      live = false;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [src]);
+  const shown = src && loadedSrc === src ? href : "";
+  if (!src || !shown) return className ? <span className={className} /> : null;
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img src={shown} alt={alt ?? ""} className={className} />
+  );
 }
 
 function storyPromptChips(
@@ -482,18 +539,19 @@ function storyPromptChips(
 ): { images: PromptChipItem[]; audios: PromptChipItem[] } {
   const images: PromptChipItem[] = [];
   const seen = new Set<string>();
-  const addImage = (key: string, url: string) => {
+  const addImage = (key: string, url: string, label: string) => {
     const u = url.trim();
     if (!u || seen.has(u)) return;
     seen.add(u);
-    images.push({ key, url: u, label: `Image${images.length + 1}`, storing: false });
+    images.push({ key, url: u, label: label.trim() || `Image${images.length + 1}`, storing: false });
   };
-  for (const img of imageAssets) addImage(img.key || img.id, img.url);
+  for (const img of imageAssets) addImage(img.key || img.id, img.url, fileStem(img.name) || img.name);
   characters.forEach((ch, i) => {
-    addImage(`char-${i}`, mediaPreview(ch.stillId, ch.stillUrl) || ch.stillUrl);
+    addImage(`char-${i}`, mediaPreview(ch.stillId, ch.stillUrl) || ch.stillUrl, `${ch.name} sheet`);
   });
   scenes.forEach((s, i) => {
-    addImage(`still-${i}`, mediaPreview(s.bridgeId, s.bridgeUrl) || s.bridgeUrl);
+    addImage(`start-${i}`, mediaPreview(s.startId, s.startUrl) || s.startUrl, `S${i + 1} start`);
+    addImage(`still-${i}`, mediaPreview(s.bridgeId, s.bridgeUrl) || s.bridgeUrl, `S${i + 1} end`);
   });
   const audios: PromptChipItem[] = [];
   const seenA = new Set<string>();
@@ -501,9 +559,141 @@ function storyPromptChips(
     const u = a.url.trim();
     if (!u || seenA.has(u)) continue;
     seenA.add(u);
-    audios.push({ key: a.key || a.id, url: u, label: `Audio${audios.length + 1}`, storing: false });
+    audios.push({
+      key: a.key || a.id,
+      url: u,
+      label: fileStem(a.name) || a.name || `Audio${audios.length + 1}`,
+      storing: false,
+    });
   }
   return { images, audios };
+}
+
+function generatedImageAliases(
+  characters: CharacterDraft[],
+  scenes: SceneDraft[],
+): { url: string; name: string; prompt: string; regen: { kind: "sheet" | "start" | "end"; index: number } }[] {
+  const out: { url: string; name: string; prompt: string; regen: { kind: "sheet" | "start" | "end"; index: number } }[] = [];
+  const seen = new Set<string>();
+  const add = (url: string, name: string, prompt: string, regen: { kind: "sheet" | "start" | "end"; index: number }) => {
+    const u = url.trim();
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    out.push({ url: u, name, prompt, regen });
+  };
+  characters.forEach((ch, i) => {
+    add(mediaPreview(ch.stillId, ch.stillUrl) || ch.stillUrl, `${ch.name} sheet`, ch.generatePrompt || ch.sheet_prompt, {
+      kind: "sheet",
+      index: i,
+    });
+  });
+  scenes.forEach((s, i) => {
+    add(mediaPreview(s.startId, s.startUrl) || s.startUrl, `S${i + 1} start`, s.startPrompt, { kind: "start", index: i });
+    add(mediaPreview(s.bridgeId, s.bridgeUrl) || s.bridgeUrl, `S${i + 1} end`, s.stillPrompt, { kind: "end", index: i });
+    (s.i2vRefs ?? []).forEach((ref, ri) => {
+      add(mediaPreview(ref.id, ref.url) || ref.url, `S${i + 1} ref ${ri + 1}`, ref.prompt ?? "", { kind: "start", index: i });
+    });
+  });
+  return out;
+}
+
+function libraryImageTotal(
+  uploads: StoryImageAsset[],
+  characters: CharacterDraft[],
+  scenes: SceneDraft[],
+): number {
+  const urls = new Set<string>();
+  for (const img of uploads) {
+    if (img.url) urls.add(img.url);
+  }
+  for (const item of generatedImageAliases(characters, scenes)) urls.add(item.url);
+  return urls.size;
+}
+
+function emptySceneDraft(style: string, cast: string[]): SceneDraft {
+  return {
+    title: "Untitled",
+    duration_sec: FLASH_STORY_SECONDS,
+    durationTouched: true,
+    cast,
+    setting: "",
+    subject: "",
+    action: "",
+    camera_movement: "",
+    lighting: "",
+    style,
+    dialogue: "{}",
+    videoPrompt: "",
+    stillPrompt: "",
+    startPrompt: "",
+    bridgeId: "",
+    bridgeUrl: "",
+    startId: "",
+    startUrl: "",
+    imageModel: DEFAULT_IMAGE_MODEL,
+    shotMode: "keyframe",
+    i2vRefs: [],
+  };
+}
+
+function parseStillRefs(value: unknown): StillRef[] {
+  if (!Array.isArray(value)) return [];
+  const out: StillRef[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue;
+    const rec = item as Record<string, unknown>;
+    const url = typeof rec.url === "string" ? rec.url.trim() : "";
+    if (!url) continue;
+    out.push({
+      id: typeof rec.id === "string" ? rec.id : "",
+      url,
+      prompt: typeof rec.prompt === "string" ? rec.prompt : undefined,
+    });
+  }
+  return out;
+}
+
+function stampShotModes(scenes: SceneDraft[]): SceneDraft[] {
+  return scenes.map((scene, i) => ({
+    ...scene,
+    shotMode: isShotMode(scene.shotMode)
+      ? scene.shotMode
+      : sceneUsesSheetI2V(scenes, i)
+        ? "i2v"
+        : "keyframe",
+    i2vRefs: Array.isArray(scene.i2vRefs) ? scene.i2vRefs : [],
+  }));
+}
+
+function insertPositionOptions(scenes: SceneDraft[]): { value: string; label: string }[] {
+  if (scenes.length === 0) return [{ value: "0", label: "At end" }];
+  const opts: { value: string; label: string }[] = [
+    { value: "0", label: `Before S1 · ${scenes[0].title.trim() || "Untitled"}` },
+  ];
+  for (let i = 0; i < scenes.length - 1; i += 1) {
+    opts.push({
+      value: String(i + 1),
+      label: `After S${i + 1} · ${scenes[i].title.trim() || "Untitled"}`,
+    });
+  }
+  opts.push({ value: String(scenes.length), label: "At end" });
+  return opts;
+}
+
+function shiftSceneIndex(value: number | null, at: number, delta: number): number | null {
+  if (value === null) return null;
+  if (delta > 0 && value >= at) return value + delta;
+  if (delta < 0 && value === at) return null;
+  if (delta < 0 && value > at) return value + delta;
+  return value;
+}
+
+function SvgIco({ path, filled = false }: { path: string; filled?: boolean }) {
+  return (
+    <svg className="story-ico" width="16" height="16" viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+      <path d={path} />
+    </svg>
+  );
 }
 
 function pushUnique(list: string[], url: string | undefined, cap: number): void {
@@ -517,6 +707,7 @@ function scenePayload(
   durationSec: number,
   opts: {
     sheets: string[];
+    i2vRefs?: string[];
     startFrame?: string;
     endFrame?: string;
     seed: number;
@@ -529,7 +720,7 @@ function scenePayload(
     selectedAudios: string[];
   },
 ): CreateRequest {
-  const { sheets, startFrame, endFrame, seed, width, height, fps, maxFrames, flashAspect, selectedImages, selectedAudios } =
+  const { sheets, i2vRefs, startFrame, endFrame, seed, width, height, fps, maxFrames, flashAspect, selectedImages, selectedAudios } =
     opts;
   if (model === MODEL_V20) {
     const refs: string[] = [];
@@ -537,6 +728,7 @@ function scenePayload(
       pushUnique(refs, startFrame, V20_KEYFRAME_MAX);
       pushUnique(refs, endFrame, V20_KEYFRAME_MAX);
     } else {
+      for (const url of i2vRefs ?? []) pushUnique(refs, url, V20_I2V_MAX);
       for (const url of selectedImages) pushUnique(refs, url, V20_KEYFRAME_MAX - 1);
       if (refs.length === 0) {
         for (const url of sheets) pushUnique(refs, url, V20_I2V_MAX);
@@ -561,6 +753,7 @@ function scenePayload(
   const images: string[] = [];
   pushUnique(images, startFrame, FLASH_IMAGE_MAX);
   pushUnique(images, endFrame, FLASH_IMAGE_MAX);
+  for (const url of i2vRefs ?? []) pushUnique(images, url, FLASH_IMAGE_MAX);
   for (const url of selectedImages) pushUnique(images, url, FLASH_IMAGE_MAX);
   for (const url of sheets) pushUnique(images, url, FLASH_IMAGE_MAX);
   const audios = selectedAudios.slice(0, FLASH_AUDIO_MAX);
@@ -605,100 +798,21 @@ function statusLabel(status: ClipStatus): string {
   return "FAILED";
 }
 
+function uniqueSceneIndexes(items: { index: number }[]): number[] {
+  return [...new Set(items.map((item) => item.index))];
+}
+
+function isPhoneStory(): boolean {
+  return typeof window !== "undefined" && window.matchMedia("(max-width: 899px)").matches;
+}
+
+type MobilePane = "canvas" | "library" | "details";
+
 function pipelineCurrent(gate: Gate, clips: Clip[], mergedUrl: string | null): PipelineStep {
   if (gate === "input") return "input";
   if (gate === "storyboard") return "storyboard";
   if (mergedUrl || (clips.length > 0 && clips.every((c) => c.status === "ready"))) return "merge";
   return "clips";
-}
-
-function ModelRadios({
-  name,
-  model,
-  disabled,
-  onChange,
-}: {
-  name: string;
-  model: ModelId;
-  disabled?: boolean;
-  onChange: (next: ModelId) => void;
-}) {
-  return (
-    <fieldset className="group">
-      <legend className="block">Model</legend>
-      <div className="choice-row">
-        <label className="radio">
-          <input
-            type="radio"
-            name={name}
-            value={MODEL_V20}
-            checked={model === MODEL_V20}
-            disabled={disabled}
-            onChange={() => onChange(MODEL_V20)}
-          />
-          v2.0 <span className="api">{MODEL_V20}</span>
-        </label>
-        <label className="radio">
-          <input
-            type="radio"
-            name={name}
-            value={MODEL_FLASH}
-            checked={model === MODEL_FLASH}
-            disabled={disabled}
-            onChange={() => onChange(MODEL_FLASH)}
-          />
-          2.5 Flash <span className="api">{MODEL_FLASH}</span>
-        </label>
-      </div>
-    </fieldset>
-  );
-}
-
-function Pipeline({
-  current,
-  onBack,
-}: {
-  current: PipelineStep;
-  onBack: (() => void) | null;
-}) {
-  const order: Record<PipelineStep, number> = { input: 0, storyboard: 1, clips: 2, merge: 3 };
-  const labels: Record<PipelineStep, string> = {
-    input: "Input",
-    storyboard: "Storyboard",
-    clips: "Clips",
-    merge: "Merge",
-  };
-  return (
-    <div className="pipeline">
-      <ol className="pipeline-steps">
-        {PIPELINE.map((id, i) => {
-          const state =
-            id === current ? "current" : order[id] < order[current] ? "done" : "future";
-          const mark = state === "done" ? "✓" : state === "current" ? "●" : "○";
-          return (
-            <li key={id} style={{ display: "contents" }}>
-              {i > 0 ? (
-                <span className="pipeline-join" aria-hidden="true">
-                  ────
-                </span>
-              ) : null}
-              <span
-                className={`pipeline-step${state === "done" ? " is-done" : ""}`}
-                aria-current={state === "current" ? "step" : undefined}
-              >
-                {labels[id]} {mark}
-              </span>
-            </li>
-          );
-        })}
-      </ol>
-      {onBack ? (
-        <button type="button" className="btn btn-ghost" onClick={onBack}>
-          Back
-        </button>
-      ) : null}
-    </div>
-  );
 }
 
 function ZoomLightbox({ src, alt, onClose }: { src: string; alt: string; onClose: () => void }) {
@@ -729,8 +843,7 @@ function ZoomLightbox({ src, alt, onClose }: { src: string; alt: string; onClose
       <button type="button" className="btn zoom-close" onClick={onClose}>
         Close
       </button>
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={src} alt={alt} />
+      <StoryCachedImg src={src} alt={alt} />
     </dialog>
   );
 }
@@ -843,10 +956,10 @@ function composeSceneVideoPrompt(index: number, scenes: SceneDraft[], characters
     return applyShotDurationLine(custom, index, durations);
   }
   const prev = index > 0 ? scenes[index - 1] : undefined;
-  const sheetI2V = sceneUsesSheetI2V(scenes, index);
+  const sheetI2V = sceneIsI2V(scenes, index);
   const needsStart = sceneNeedsGeneratedStart(scenes, index);
   return formatStoryShot(index, durations, scene, sceneCastLocks(scene, characters), {
-    hasStart: index > 0 && !sheetI2V,
+    hasStart: !sheetI2V && (index > 0 || needsStart || Boolean(scene.startUrl)),
     hasEnd: !sheetI2V,
     startIsGenerated: needsStart,
     prevEnd: prev ? { setting: prev.setting, subject: prev.subject, action: prev.action } : undefined,
@@ -855,58 +968,32 @@ function composeSceneVideoPrompt(index: number, scenes: SceneDraft[], characters
 }
 
 function SceneDurationPicker({
-  index,
+  id,
   scene,
-  model,
-  durationOptions,
-  v20Resolution,
-  fps,
-  planMaxSec,
-  namePrefix,
   onPatch,
 }: {
-  index: number;
+  id: string;
   scene: SceneDraft;
-  model: ModelId;
-  durationOptions: number[];
-  v20Resolution: V20Resolution;
-  fps: V20Fps;
-  planMaxSec: number;
-  namePrefix: string;
   onPatch: (partial: Partial<SceneDraft>) => void;
 }) {
-  const capHint =
-    model === MODEL_FLASH
-      ? `Flash 2.5 hard max is ${FLASH_STORY_SECONDS}s. Every story scene is ${FLASH_STORY_SECONDS}s.`
-      : `Legal lengths at ${v20Resolution} · ${fps} fps (max ${planMaxSec}s). Same cap on every scene.`;
-  if (model === MODEL_V20) {
-    return (
-      <fieldset className="group">
-        <legend>Duration</legend>
-        <div className="pill-row">
-          {durationOptions.map((opt) => (
-            <label key={opt}>
-              <input
-                type="radio"
-                name={`${namePrefix}-dur-${index}`}
-                value={opt}
-                checked={scene.duration_sec === opt}
-                onChange={() => onPatch({ duration_sec: opt, durationTouched: true })}
-              />
-              <span>{opt}s</span>
-            </label>
-          ))}
-        </div>
-        <p className="hint">{capHint}</p>
-      </fieldset>
-    );
-  }
   return (
-    <div className="row">
-      <p className="field">Duration</p>
-      <p>{FLASH_STORY_SECONDS}s</p>
-      <p className="hint">{capHint}</p>
-    </div>
+    <>
+      <label className="story-field" htmlFor={id}>
+        Duration
+      </label>
+      <select
+        id={id}
+        value={scene.duration_sec}
+        onChange={(e) => onPatch({ duration_sec: Number(e.target.value), durationTouched: true })}
+      >
+        {FLASH_STORY_DURATION_OPTIONS.map((opt) => (
+          <option key={opt} value={opt}>
+            {opt}s
+          </option>
+        ))}
+      </select>
+      <p className="story-hint">Default {FLASH_STORY_SECONDS}s. Flash allows {FLASH_STORY_DURATION_OPTIONS[0]}–{FLASH_STORY_SECONDS}s.</p>
+    </>
   );
 }
 
@@ -920,8 +1007,8 @@ function ImageModelSelect({
   onChange: (model: ImageModelId) => void;
 }) {
   return (
-    <div className="row">
-      <label className="field" htmlFor={id}>
+    <>
+      <label className="story-field" htmlFor={id}>
         Image model
       </label>
       <select
@@ -939,11 +1026,11 @@ function ImageModelSelect({
           </option>
         ))}
       </select>
-      <p className="hint">
+      <p className="story-hint">
         Default is {IMAGE_MODELS.find((m) => m.id === DEFAULT_IMAGE_MODEL)?.label}. All three are
         free.
       </p>
-    </div>
+    </>
   );
 }
 
@@ -987,9 +1074,10 @@ function SceneBeatPair({
     ? characters.filter((c) => wanted.includes(c.name.toLowerCase()))
     : characters
   ).filter((c) => c.stillUrl || c.stillId);
-  const sheetI2V = sceneUsesSheetI2V(scenes, index);
+  const sheetI2V = sceneIsI2V(scenes, index);
   const needsStart = sceneNeedsGeneratedStart(scenes, index);
   const prev = index > 0 ? scenes[index - 1] : null;
+  const i2vRefs = scene.i2vRefs ?? [];
   const generatedStartSrc =
     needsStart && (scene.startId || scene.startUrl) ? mediaPreview(scene.startId, scene.startUrl) : "";
   const startSrc =
@@ -999,13 +1087,25 @@ function SceneBeatPair({
   const endSrc = scene.bridgeId || scene.bridgeUrl ? mediaPreview(scene.bridgeId, scene.bridgeUrl) : "";
   const nextIndex = index + 2;
   const hasNext = index + 1 < scenes.length;
-  const showSheetsAtStart = sheetI2V;
+  const showI2vRefs = sheetI2V && i2vRefs.length > 0;
+  const showSheetsAtStart = sheetI2V && !showI2vRefs;
 
   return (
     <div className="scene-beats">
       <div className="scene-beat">
         <p className="field">Start</p>
-        {showSheetsAtStart ? (
+        {showI2vRefs ? (
+          <div className="scene-beat-cast">
+            {i2vRefs.map((ref, ri) => (
+              <ZoomableImage
+                key={ref.id || ref.url || `ref-${ri}`}
+                src={mediaPreview(ref.id, ref.url)}
+                alt={`Scene ${index + 1} ref ${ri + 1}`}
+                onZoom={onZoom}
+              />
+            ))}
+          </div>
+        ) : showSheetsAtStart ? (
           castSheets.length > 0 ? (
             <div className="scene-beat-cast">
               {castSheets.map((ch) => (
@@ -1044,7 +1144,9 @@ function SceneBeatPair({
         {needsStart && startError ? <p className="form-error">{startError}</p> : null}
         <p className="hint">
           {sheetI2V
-            ? "Image-to-video from character sheets. No generated start still."
+            ? showI2vRefs
+              ? "Image-to-video from generated or uploaded refs. No end still."
+              : "Image-to-video from character sheets. No generated start still."
             : needsStart
               ? "Previous clip was image-to-video (no end still). This opening still is generated."
               : `Same picture as end of scene ${index}`}
@@ -1077,7 +1179,7 @@ function SceneBeatPair({
       <div className="scene-beat">
         <p className="field">End</p>
         {sheetI2V ? (
-          <p className="hint">No end still. This clip is image-to-video from the character sheets.</p>
+          <p className="hint">No end still. This clip is image-to-video.</p>
         ) : endSrc ? (
           <ZoomableImage
             src={endSrc}
@@ -1122,322 +1224,628 @@ function SceneBeatPair({
   );
 }
 
-function PillRow<T extends string | number>({
-  legend,
+function FlashAspectPills({
   name,
-  options,
   value,
-  format,
   onChange,
-  hint,
 }: {
-  legend: string;
   name: string;
-  options: readonly T[];
-  value: T;
-  format?: (opt: T) => string;
-  onChange: (opt: T) => void;
-  hint?: string;
+  value: FlashAspectRatio;
+  onChange: (next: FlashAspectRatio) => void;
 }) {
   return (
-    <fieldset className="group">
-      <legend>{legend}</legend>
-      <div className="pill-row">
-        {options.map((opt) => (
-          <label key={String(opt)}>
-            <input
-              type="radio"
-              name={name}
-              value={String(opt)}
-              checked={value === opt}
-              onChange={() => onChange(opt)}
-            />
-            <span>{format ? format(opt) : String(opt)}</span>
-          </label>
-        ))}
-      </div>
-      {hint ? <p className="hint">{hint}</p> : null}
-    </fieldset>
+    <div className="story-pills" role="radiogroup" aria-label="Aspect">
+      {FLASH_ASPECT_RATIOS.map((opt) => (
+        <button
+          key={opt}
+          type="button"
+          className={`story-pill${value === opt ? " is-on" : ""}`}
+          aria-pressed={value === opt}
+          onClick={() => onChange(opt)}
+        >
+          {opt}
+        </button>
+      ))}
+    </div>
   );
 }
 
-function FilmSettings({
-  idPrefix,
-  model,
-  resolution,
-  fps,
-  v20Aspect,
-  flashAspect,
-  onResolution,
-  onFps,
-  onV20Aspect,
-  onFlashAspect,
+function DialogueTurnsEditor({
+  turns,
+  onChange,
 }: {
-  idPrefix: string;
-  model: ModelId;
-  resolution: V20Resolution;
-  fps: V20Fps;
-  v20Aspect: V20FrameSizeId;
-  flashAspect: FlashAspectRatio;
-  onResolution: (next: V20Resolution) => void;
-  onFps: (next: V20Fps) => void;
-  onV20Aspect: (next: V20FrameSizeId) => void;
-  onFlashAspect: (next: FlashAspectRatio) => void;
+  turns: DialogueTurn[];
+  onChange: (next: DialogueTurn[]) => void;
 }) {
-  const size = v20Size(resolution, v20Aspect);
-  const maxFrames = maxFramesForPixels(size.width, size.height);
-  const timing = storyTiming(model, fps, maxFrames);
-  if (model === MODEL_FLASH) {
-    return (
-      <div>
-        <h2 className="block">Film settings</h2>
-        <div className="settings-grid">
-          <fieldset className="group">
-            <legend>Aspect</legend>
-            <div className="pill-row">
-              {FLASH_ASPECT_RATIOS.map((opt) => (
-                <label key={opt}>
-                  <input
-                    type="radio"
-                    name={`${idPrefix}-flash-aspect`}
-                    value={opt}
-                    checked={flashAspect === opt}
-                    onChange={() => onFlashAspect(opt)}
-                  />
-                  <span>{opt}</span>
-                </label>
-              ))}
-            </div>
-            <p className="hint">
-              Flash has no fps. Every scene is {FLASH_STORY_SECONDS}s (2.5 Flash hard max).
-            </p>
-          </fieldset>
-        </div>
-      </div>
-    );
-  }
   return (
     <div>
-      <h2 className="block">Film settings</h2>
-      <div className="settings-grid">
-        <PillRow
-          legend="Resolution"
-          name={`${idPrefix}-resolution`}
-          options={V20_RESOLUTIONS}
-          value={resolution}
-          onChange={onResolution}
-          hint={`${resolution} · max ${maxFrames} frames`}
-        />
-        <PillRow
-          legend="FPS"
-          name={`${idPrefix}-fps`}
-          options={V20_FPS_OPTIONS}
-          value={fps}
-          onChange={onFps}
-        />
-        <fieldset className="group">
-          <legend>Aspect</legend>
-          <div className="pill-row">
-            {V20_ASPECTS.map((opt) => (
-              <label key={opt}>
-                <input
-                  type="radio"
-                  name={`${idPrefix}-aspect`}
-                  value={opt}
-                  checked={v20Aspect === opt}
-                  onChange={() => onV20Aspect(opt)}
-                />
-                <span>{opt}</span>
-              </label>
-            ))}
-          </div>
-          <p className="hint">Agnes may normalize. Trust the file, not these pixels.</p>
-        </fieldset>
-      </div>
-      <p className="hint">
-        Max duration of a scene is based on resolution and fps. At {resolution} · {fps} fps a clip can be{" "}
-        {timing.min}–{timing.max}s (max {timing.max}s). No film-level duration — each beat picks its own
-        length inside that range. Applies to every scene.
-      </p>
+      <p className="story-field">Dialogue</p>
+      {turns.length === 0 ? <p className="story-hint">No lines. Add who-says-what.</p> : null}
+      {turns.map((turn, i) => (
+        <div className="story-dlg-row" key={`dlg-${i}`}>
+          <input
+            type="text"
+            value={turn.speaker}
+            aria-label={`Speaker ${i + 1}`}
+            placeholder="Who"
+            onChange={(e) => {
+              const next = turns.slice();
+              next[i] = { ...turn, speaker: e.target.value };
+              onChange(next);
+            }}
+          />
+          <input
+            type="text"
+            value={turn.line}
+            aria-label={`Line ${i + 1}`}
+            placeholder="Says what"
+            onChange={(e) => {
+              const next = turns.slice();
+              next[i] = { ...turn, line: e.target.value };
+              onChange(next);
+            }}
+          />
+          <button
+            type="button"
+            className="story-tiny"
+            aria-label={`Remove line ${i + 1}`}
+            onClick={() => onChange(turns.filter((_, j) => j !== i))}
+          >
+            −
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        className="story-add-line"
+        onClick={() => onChange([...turns, { speaker: "", line: "" }])}
+      >
+        Add line
+      </button>
     </div>
   );
 }
 
-function AssetLibrary({
-  idPrefix,
-  disabled,
-  storing,
-  characters,
-  sceneCount,
-  imageAssets,
-  audioAssets,
-  model,
-  onPickImages,
-  onPickAudios,
-  onPatchImage,
-  onPatchAudio,
-  onRemoveImage,
-  onRemoveAudio,
+type AddSceneForm = {
+  title: string;
+  duration_sec: number;
+  setting: string;
+  subject: string;
+  action: string;
+  position: string;
+  shotMode: ShotMode;
+  imageModel: ImageModelId;
+  i2vRefs: StillRef[];
+  startId: string;
+  startUrl: string;
+  startPrompt: string;
+  bridgeId: string;
+  bridgeUrl: string;
+  stillPrompt: string;
+};
+
+type AddBeatErrorField = "setting" | "subject" | "action" | "shot" | "stills";
+
+function ModalStillThumb({
+  src,
+  label,
+  onRemove,
 }: {
-  idPrefix: string;
-  disabled: boolean;
-  storing: boolean;
-  characters: CharacterDraft[];
-  sceneCount: number;
-  imageAssets: StoryImageAsset[];
-  audioAssets: StoryAudioAsset[];
-  model: ModelId;
-  onPickImages: (files: File[]) => void;
-  onPickAudios: (files: File[]) => void;
-  onPatchImage: (key: string, patch: Partial<StoryImageAsset>) => void;
-  onPatchAudio: (key: string, patch: Partial<StoryAudioAsset>) => void;
-  onRemoveImage: (key: string) => void;
-  onRemoveAudio: (key: string) => void;
+  src: string;
+  label: string;
+  onRemove: () => void;
 }) {
   return (
-    <div className="asset-library">
-      <h2 className="block">Reference images</h2>
-      <p className="hint">
-        Character stills and keyframes. Check the ones to send with scene 1 (within Agnes caps). After the
-        storyboard, map stills to people. Unmapped stills become extra characters; missing people get a
-        generated spritesheet.
-      </p>
-      <label className="field" htmlFor={`${idPrefix}-images`}>
-        Choose images
-      </label>
-      <input
-        id={`${idPrefix}-images`}
-        type="file"
-        accept={IMAGE_ACCEPT}
-        multiple
-        disabled={disabled || storing || imageAssets.length >= STORY_IMAGE_LIBRARY_MAX}
-        onChange={(e) => {
-          const files = Array.from(e.target.files ?? []);
-          e.target.value = "";
-          onPickImages(files);
+    <span className="story-ref-thumb">
+      <StoryCachedImg src={src} alt="" />
+      <span>{label}</span>
+      <button type="button" className="story-ref-x" aria-label={`Remove ${label}`} onClick={onRemove}>
+        ×
+      </button>
+    </span>
+  );
+}
+
+function AddSceneModal({
+  kind,
+  scenes,
+  ratio,
+  onClose,
+  onAdd,
+}: {
+  kind: "scene" | "clip";
+  scenes: SceneDraft[];
+  ratio: FlashAspectRatio;
+  onClose: () => void;
+  onAdd: (form: AddSceneForm) => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const summaryRef = useRef<HTMLDivElement>(null);
+  const [title, setTitle] = useState("Untitled");
+  const [duration, setDuration] = useState(FLASH_STORY_SECONDS);
+  const [setting, setSetting] = useState("");
+  const [subject, setSubject] = useState("");
+  const [action, setAction] = useState("");
+  const [position, setPosition] = useState(String(scenes.length));
+  const [shotMode, setShotMode] = useState<ShotMode | "">("");
+  const [imageModel, setImageModel] = useState<ImageModelId>(DEFAULT_IMAGE_MODEL);
+  const [i2vPrompt, setI2vPrompt] = useState("");
+  const [i2vRefs, setI2vRefs] = useState<StillRef[]>([]);
+  const [kfStartPrompt, setKfStartPrompt] = useState("");
+  const [kfEndPrompt, setKfEndPrompt] = useState("");
+  const [kfStart, setKfStart] = useState<StillRef | null>(null);
+  const [kfEnd, setKfEnd] = useState<StillRef | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [errors, setErrors] = useState<{ field: AddBeatErrorField; message: string }[]>([]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (!el.open) el.showModal();
+    const onCancel = (e: Event) => {
+      e.preventDefault();
+      onClose();
+    };
+    el.addEventListener("cancel", onCancel);
+    return () => {
+      el.removeEventListener("cancel", onCancel);
+      if (el.open) el.close();
+    };
+  }, [onClose]);
+
+  const positions = insertPositionOptions(scenes);
+  const stillsReady =
+    shotMode === "i2v" ? i2vRefs.length > 0 : shotMode === "keyframe" ? Boolean(kfStart && kfEnd) : false;
+  const canSubmit =
+    Boolean(setting.trim() && subject.trim() && action.trim() && shotMode && stillsReady) && !busy;
+  const ids: Record<AddBeatErrorField, string> = {
+    setting: "add-beat-setting",
+    subject: "add-beat-subject",
+    action: "add-beat-action",
+    shot: "add-beat-shot",
+    stills: shotMode === "i2v" ? "add-beat-i2v-prompt" : "add-beat-kf-start",
+  };
+
+  async function generateStill(prompt: string): Promise<StillRef | null> {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      setGenError("Enter a prompt, then generate.");
+      return null;
+    }
+    setGenError(null);
+    try {
+      const res = await fetch("/api/scene-still", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: trimmed,
+          ratio,
+          model: imageModel,
+          validate: false,
+        }),
+      });
+      if (!res.ok) {
+        setGenError(await readDetail(res));
+        return null;
+      }
+      const body: unknown = await res.json();
+      const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : null;
+      const url = rec && typeof rec.url === "string" ? rec.url : "";
+      const id = rec && typeof rec.id === "string" ? rec.id : "";
+      if (!url) {
+        setGenError("That still did not return an image.");
+        return null;
+      }
+      return { id, url, prompt: trimmed };
+    } catch {
+      setGenError("Could not draw this still.");
+      return null;
+    }
+  }
+
+  async function uploadStill(file: File | undefined): Promise<StillRef | null> {
+    if (!file) return null;
+    setGenError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/videos/media", { method: "POST", body: fd });
+      if (!res.ok) {
+        setGenError(await readDetail(res));
+        return null;
+      }
+      const body: unknown = await res.json();
+      const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : null;
+      const url = rec && typeof rec.url === "string" ? rec.url : "";
+      const id = rec && typeof rec.id === "string" ? rec.id : "";
+      if (!url) {
+        setGenError("Could not store this file.");
+        return null;
+      }
+      return { id, url, prompt: file.name };
+    } catch {
+      setGenError("Could not store this file.");
+      return null;
+    }
+  }
+
+  function submit() {
+    const next: { field: AddBeatErrorField; message: string }[] = [];
+    if (!setting.trim()) next.push({ field: "setting", message: "Enter a setting." });
+    if (!subject.trim()) next.push({ field: "subject", message: "Enter a subject." });
+    if (!action.trim()) next.push({ field: "action", message: "Enter an action." });
+    if (!isShotMode(shotMode)) next.push({ field: "shot", message: "Choose Image to video or Keyframe to video." });
+    if (isShotMode(shotMode) && !stillsReady) {
+      next.push({
+        field: "stills",
+        message: shotMode === "i2v" ? "Generate or upload at least one ref." : "Need a start still and an end still.",
+      });
+    }
+    if (next.length > 0) {
+      setErrors(next);
+      queueMicrotask(() => summaryRef.current?.focus());
+      return;
+    }
+    if (!isShotMode(shotMode)) return;
+    onAdd({
+      title,
+      duration_sec: duration,
+      setting,
+      subject,
+      action,
+      position,
+      shotMode,
+      imageModel,
+      i2vRefs,
+      startId: kfStart?.id ?? "",
+      startUrl: kfStart?.url ?? "",
+      startPrompt: kfStartPrompt,
+      bridgeId: kfEnd?.id ?? "",
+      bridgeUrl: kfEnd?.url ?? "",
+      stillPrompt: kfEndPrompt,
+    });
+  }
+
+  return (
+    <dialog
+      ref={ref}
+      className="story-modal"
+      aria-labelledby="add-beat-title"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <form
+        className="box story-modal-panel"
+        noValidate
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
         }}
-      />
-      <p className="hint">
-        {imageAssets.length}/{STORY_IMAGE_LIBRARY_MAX} images
-        {storing ? " · storing…" : ""}
-      </p>
-      {imageAssets.map((img, index) => (
-        <div className="asset-row" key={img.key}>
-          <label className="asset-check">
-            <input
-              type="checkbox"
-              checked={img.selected}
-              disabled={disabled}
-              onChange={(e) => onPatchImage(img.key, { selected: e.target.checked })}
+      >
+        <h3 id="add-beat-title" style={{ margin: "0 0 10px" }}>
+          {kind === "clip" ? "Add clip" : "Add scene"}
+        </h3>
+        {errors.length > 0 ? (
+          <div
+            ref={summaryRef}
+            className="story-error-summary"
+            role="alert"
+            tabIndex={-1}
+            aria-labelledby="add-beat-errors"
+          >
+            <p id="add-beat-errors" style={{ margin: "0 0 6px", fontWeight: 700 }}>
+              There is a problem
+            </p>
+            {errors.map((err) => (
+              <a key={err.field} href={`#${ids[err.field]}`}>
+                {err.message}
+              </a>
+            ))}
+          </div>
+        ) : null}
+        <label className="story-field" htmlFor="add-beat-name">
+          Title
+        </label>
+        <input id="add-beat-name" type="text" value={title} onChange={(e) => setTitle(e.target.value)} />
+        <label className="story-field" htmlFor="add-beat-dur">
+          Duration
+        </label>
+        <select
+          id="add-beat-dur"
+          value={duration}
+          onChange={(e) => setDuration(Number(e.target.value))}
+        >
+          {FLASH_STORY_DURATION_OPTIONS.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}s
+            </option>
+          ))}
+        </select>
+        <label className="story-field" htmlFor="add-beat-setting">
+          Setting{" "}
+          <abbr className="req" title="required">
+            *
+          </abbr>
+        </label>
+        <textarea
+          id="add-beat-setting"
+          value={setting}
+          aria-invalid={errors.some((e) => e.field === "setting") ? true : undefined}
+          onChange={(e) => setSetting(e.target.value)}
+        />
+        {errors.some((e) => e.field === "setting") ? (
+          <p className="story-field-error">Enter a setting.</p>
+        ) : null}
+        <label className="story-field" htmlFor="add-beat-subject">
+          Subject{" "}
+          <abbr className="req" title="required">
+            *
+          </abbr>
+        </label>
+        <textarea
+          id="add-beat-subject"
+          value={subject}
+          aria-invalid={errors.some((e) => e.field === "subject") ? true : undefined}
+          onChange={(e) => setSubject(e.target.value)}
+        />
+        {errors.some((e) => e.field === "subject") ? (
+          <p className="story-field-error">Enter a subject.</p>
+        ) : null}
+        <label className="story-field" htmlFor="add-beat-action">
+          Action{" "}
+          <abbr className="req" title="required">
+            *
+          </abbr>
+        </label>
+        <textarea
+          id="add-beat-action"
+          value={action}
+          aria-invalid={errors.some((e) => e.field === "action") ? true : undefined}
+          onChange={(e) => setAction(e.target.value)}
+        />
+        {errors.some((e) => e.field === "action") ? (
+          <p className="story-field-error">Enter an action.</p>
+        ) : null}
+        <label className="story-field" htmlFor="add-beat-pos">
+          Position
+        </label>
+        <select id="add-beat-pos" value={position} onChange={(e) => setPosition(e.target.value)}>
+          {positions.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+        <p className="story-field" id="add-beat-shot">
+          Shot type{" "}
+          <abbr className="req" title="required">
+            *
+          </abbr>
+        </p>
+        <div className="story-pills" role="group" aria-labelledby="add-beat-shot">
+          <button
+            type="button"
+            className={`story-pill${shotMode === "i2v" ? " is-on" : ""}`}
+            aria-pressed={shotMode === "i2v"}
+            onClick={() => setShotMode("i2v")}
+          >
+            Image to video
+          </button>
+          <button
+            type="button"
+            className={`story-pill${shotMode === "keyframe" ? " is-on" : ""}`}
+            aria-pressed={shotMode === "keyframe"}
+            onClick={() => setShotMode("keyframe")}
+          >
+            Keyframe to video
+          </button>
+        </div>
+        {errors.some((e) => e.field === "shot") ? (
+          <p className="story-field-error">Choose Image to video or Keyframe to video.</p>
+        ) : null}
+
+        {shotMode === "i2v" ? (
+          <div className="story-shot-block">
+            <ImageModelSelect id="add-beat-i2v-model" value={imageModel} onChange={setImageModel} />
+            <label className="story-field" htmlFor="add-beat-i2v-prompt">
+              Prompt
+            </label>
+            <textarea
+              id="add-beat-i2v-prompt"
+              value={i2vPrompt}
+              placeholder="Describe the reference still for this clip"
+              onChange={(e) => setI2vPrompt(e.target.value)}
             />
-            <span className="visually-hidden">Use {img.name}</span>
-          </label>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img className="asset-thumb" src={mediaPreview(img.id, img.url)} alt="" />
-          <div className="asset-meta">
-            <p className="mono">{img.name}</p>
-            <div className="asset-maps">
-              <label>
-                <span className="visually-hidden">Image kind {index + 1}</span>
-                <select
-                  value={img.kind}
-                  disabled={disabled}
-                  onChange={(e) => onPatchImage(img.key, { kind: e.target.value as ImageKind })}
-                >
-                  <option value="character">Character still</option>
-                  <option value="keyframe">Keyframe / reference</option>
-                </select>
+            <div className="story-tiny-row">
+              <label className="story-tiny" style={{ display: "inline-flex", alignItems: "center", cursor: "pointer" }}>
+                Upload
+                <input
+                  type="file"
+                  accept={IMAGE_ACCEPT}
+                  hidden
+                  disabled={Boolean(busy) || i2vRefs.length >= FLASH_IMAGE_MAX}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (!file) return;
+                    setBusy("Uploading…");
+                    void uploadStill(file).then((still) => {
+                      if (still) setI2vRefs((prev) => [...prev, still].slice(0, FLASH_IMAGE_MAX));
+                      setBusy(null);
+                    });
+                  }}
+                />
               </label>
-              {img.kind === "character" ? (
-                <label>
-                  <span className="visually-hidden">Map image {index + 1}</span>
-                  <select
-                    value={img.characterName}
-                    disabled={disabled}
-                    onChange={(e) => onPatchImage(img.key, { characterName: e.target.value })}
-                  >
-                    <option value="">
-                      {characters.length > 0 ? "Unmapped — new or auto" : "Assign after storyboard"}
-                    </option>
-                    {characters.map((ch) => (
-                      <option key={ch.name} value={ch.name}>
-                        {ch.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              ) : null}
+              <button
+                type="button"
+                className="story-tiny"
+                disabled={Boolean(busy) || i2vRefs.length >= FLASH_IMAGE_MAX}
+                onClick={() => {
+                  setBusy("Generating…");
+                  void generateStill(i2vPrompt).then((still) => {
+                    if (still) setI2vRefs((prev) => [...prev, still].slice(0, FLASH_IMAGE_MAX));
+                    setBusy(null);
+                  });
+                }}
+              >
+                Generate
+              </button>
+            </div>
+            <p className="story-hint">Need at least one ref. Mix upload and generate.</p>
+            <div className="story-ref-row">
+              {i2vRefs.map((item, i) => (
+                <ModalStillThumb
+                  key={item.id || item.url}
+                  src={mediaPreview(item.id, item.url)}
+                  label={`Ref ${i + 1}`}
+                  onRemove={() => setI2vRefs((prev) => prev.filter((_, idx) => idx !== i))}
+                />
+              ))}
             </div>
           </div>
-          <button type="button" className="btn" disabled={disabled} onClick={() => onRemoveImage(img.key)}>
-            Remove
-          </button>
-        </div>
-      ))}
+        ) : null}
 
-      <h2 className="block">Reference audio</h2>
-      <p className="hint">
-        {model === MODEL_FLASH
-          ? `Selected audio is sent with Flash clips (max ${FLASH_AUDIO_MAX} per scene). Map to all scenes or one beat.`
-          : "v2.0 has no audio API. Switch to Flash to send these files. Mapping is kept."}
-      </p>
-      <label className="field" htmlFor={`${idPrefix}-audios`}>
-        Choose audios
-      </label>
-      <input
-        id={`${idPrefix}-audios`}
-        type="file"
-        accept={AUDIO_ACCEPT}
-        multiple
-        disabled={disabled || storing || audioAssets.length >= STORY_AUDIO_LIBRARY_MAX}
-        onChange={(e) => {
-          const files = Array.from(e.target.files ?? []);
-          e.target.value = "";
-          onPickAudios(files);
-        }}
-      />
-      <p className="hint">
-        {audioAssets.length}/{STORY_AUDIO_LIBRARY_MAX} audios
-      </p>
-      {audioAssets.map((aud, index) => (
-        <div className="asset-row" key={aud.key}>
-          <label className="asset-check">
-            <input
-              type="checkbox"
-              checked={aud.selected}
-              disabled={disabled}
-              onChange={(e) => onPatchAudio(aud.key, { selected: e.target.checked })}
-            />
-            <span className="visually-hidden">Use {aud.name}</span>
-          </label>
-          <div className="asset-meta">
-            <p className="mono">{aud.name}</p>
-            <label>
-              <span className="visually-hidden">Map audio {index + 1}</span>
-              <select
-                value={aud.sceneIndex === null ? "all" : String(aud.sceneIndex)}
-                disabled={disabled}
-                onChange={(e) =>
-                  onPatchAudio(aud.key, {
-                    sceneIndex: e.target.value === "all" ? null : Number(e.target.value),
-                  })
-                }
-              >
-                <option value="all">All scenes</option>
-                {Array.from({ length: Math.max(sceneCount, 1) }, (_, i) => (
-                  <option key={i} value={String(i)}>
-                    Scene {i + 1}
-                  </option>
-                ))}
-              </select>
-            </label>
+        {shotMode === "keyframe" ? (
+          <div className="story-shot-block">
+            <ImageModelSelect id="add-beat-kf-model" value={imageModel} onChange={setImageModel} />
+            <div className="story-kf-slot">
+              <p className="story-field" id="add-beat-kf-start">
+                Start still
+              </p>
+              <textarea
+                id="add-beat-kf-start-prompt"
+                value={kfStartPrompt}
+                placeholder="Opening frame prompt"
+                onChange={(e) => setKfStartPrompt(e.target.value)}
+              />
+              <div className="story-tiny-row">
+                <label className="story-tiny" style={{ display: "inline-flex", alignItems: "center", cursor: "pointer" }}>
+                  Upload
+                  <input
+                    type="file"
+                    accept={IMAGE_ACCEPT}
+                    hidden
+                    disabled={Boolean(busy)}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      if (!file) return;
+                      setBusy("Uploading…");
+                      void uploadStill(file).then((still) => {
+                        if (still) setKfStart(still);
+                        setBusy(null);
+                      });
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="story-tiny"
+                  disabled={Boolean(busy)}
+                  onClick={() => {
+                    setBusy("Generating start…");
+                    void generateStill(kfStartPrompt).then((still) => {
+                      if (still) setKfStart(still);
+                      setBusy(null);
+                    });
+                  }}
+                >
+                  Generate
+                </button>
+              </div>
+              <div className="story-ref-row">
+                {kfStart ? (
+                  <ModalStillThumb
+                    src={mediaPreview(kfStart.id, kfStart.url)}
+                    label="Start"
+                    onRemove={() => setKfStart(null)}
+                  />
+                ) : null}
+              </div>
+            </div>
+            <div className="story-kf-slot">
+              <p className="story-field">End still</p>
+              <textarea
+                id="add-beat-kf-end-prompt"
+                value={kfEndPrompt}
+                placeholder="Last frame prompt"
+                onChange={(e) => setKfEndPrompt(e.target.value)}
+              />
+              <div className="story-tiny-row">
+                <label className="story-tiny" style={{ display: "inline-flex", alignItems: "center", cursor: "pointer" }}>
+                  Upload
+                  <input
+                    type="file"
+                    accept={IMAGE_ACCEPT}
+                    hidden
+                    disabled={Boolean(busy)}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      if (!file) return;
+                      setBusy("Uploading…");
+                      void uploadStill(file).then((still) => {
+                        if (still) setKfEnd(still);
+                        setBusy(null);
+                      });
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="story-tiny"
+                  disabled={Boolean(busy)}
+                  onClick={() => {
+                    setBusy("Generating end…");
+                    void generateStill(kfEndPrompt).then((still) => {
+                      if (still) setKfEnd(still);
+                      setBusy(null);
+                    });
+                  }}
+                >
+                  Generate
+                </button>
+              </div>
+              <div className="story-ref-row">
+                {kfEnd ? (
+                  <ModalStillThumb
+                    src={mediaPreview(kfEnd.id, kfEnd.url)}
+                    label="End"
+                    onRemove={() => setKfEnd(null)}
+                  />
+                ) : null}
+              </div>
+            </div>
+            <p className="story-hint">First scene keyframe needs its own start and end.</p>
           </div>
-          <button type="button" className="btn" disabled={disabled} onClick={() => onRemoveAudio(aud.key)}>
-            Remove
+        ) : null}
+
+        {errors.some((e) => e.field === "stills") ? (
+          <p className="story-field-error">
+            {shotMode === "i2v" ? "Generate or upload at least one ref." : "Need a start still and an end still."}
+          </p>
+        ) : null}
+        {busy ? <p className="story-hint">{busy}</p> : null}
+        {genError ? <p className="form-error">{genError}</p> : null}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 12, justifyContent: "flex-end" }}>
+          <button type="button" className="story-tiny" onClick={onClose}>
+            Close
+          </button>
+          <button
+            type="submit"
+            className="story-cta"
+            style={{ height: 32, boxShadow: "none" }}
+            disabled={!canSubmit}
+          >
+            {kind === "clip" ? "Add clip" : "Add scene"}
           </button>
         </div>
-      ))}
-    </div>
+      </form>
+    </dialog>
   );
 }
 
@@ -1453,7 +1861,7 @@ export const StoryWorkbench = forwardRef<
   const [gate, setGate] = useState<Gate>("input");
   const [source, setSource] = useState<SourceMode>("topic");
   const [text, setText] = useState("");
-  const [model, setModel] = useState<ModelId>(MODEL_V20);
+  const model = MODEL_FLASH;
   const [targetMinutes, setTargetMinutes] = useState(STORY_DEFAULT_MINUTES);
   const [v20Resolution, setV20Resolution] = useState<V20Resolution>(DEFAULT_V20_RESOLUTION);
   const [fps, setFps] = useState<V20Fps>(DEFAULT_FRAME_RATE);
@@ -1486,8 +1894,22 @@ export const StoryWorkbench = forwardRef<
   const closeZoom = useCallback(() => setZoom(null), []);
   const [stillBusy, setStillBusy] = useState(false);
   const [stillNote, setStillNote] = useState("");
+  const [drawingScenes, setDrawingScenes] = useState<number[]>([]);
+  const [mobilePane, setMobilePane] = useState<MobilePane>("canvas");
   const [stillErrors, setStillErrors] = useState<Record<number, string>>({});
   const [startErrors, setStartErrors] = useState<Record<number, string>>({});
+  const [selectedScene, setSelectedScene] = useState(0);
+  const [beatFocus, setBeatFocus] = useState<BeatFocus>("wait");
+  const [inspectKind, setInspectKind] = useState<"sheet" | "start" | "end" | null>(null);
+  const [selectedCast, setSelectedCast] = useState<number | null>(null);
+  const [stillTab, setStillTab] = useState<"up" | "gen">("up");
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [addModal, setAddModal] = useState<"scene" | "clip" | null>(null);
+  const [bridgeNote, setBridgeNote] = useState("");
+  const addBtnRef = useRef<HTMLButtonElement>(null);
+  const addClipBtnRef = useRef<HTMLButtonElement>(null);
+  const beatDragRef = useRef<number | null>(null);
+  const studioRef = useRef<HTMLDivElement>(null);
 
   const scenesHeadingRef = useRef<HTMLHeadingElement>(null);
   const mergedPlayerRef = useRef<HTMLVideoElement>(null);
@@ -1515,7 +1937,6 @@ export const StoryWorkbench = forwardRef<
   const seedRef = useRef(0);
   const keyRef = useRef(agnesApiKey);
   const charactersRef = useRef<CharacterDraft[]>([]);
-  const imageModelRef = useRef<ImageModelId>(DEFAULT_IMAGE_MODEL);
   scenesRef.current = scenes;
   clipsRef.current = clips;
   modelRef.current = model;
@@ -1534,14 +1955,9 @@ export const StoryWorkbench = forwardRef<
   seedRef.current = seed ?? 0;
   keyRef.current = agnesApiKey;
   charactersRef.current = characters;
-  imageModelRef.current = characters[0]?.imageModel ?? DEFAULT_IMAGE_MODEL;
   filmStyleRef.current = filmStyle;
   storyRef.current = story;
 
-  const durationOptions = useMemo(
-    () => allowedV20Durations(fps, filmMaxFrames),
-    [fps, filmMaxFrames],
-  );
   const mentionMedia = useMemo(
     () => storyPromptChips(imageAssets, audioAssets, characters, scenes),
     [imageAssets, audioAssets, characters, scenes],
@@ -1551,9 +1967,7 @@ export const StoryWorkbench = forwardRef<
     [mergeOrder, clips.length],
   );
   const totalSec = scenes.reduce((sum, s) => sum + s.duration_sec, 0);
-  const planRange = storySceneRange(targetMinutes, model, fps, filmMaxFrames);
-  const planMinSec = storyClipMinSec(model, fps, filmMaxFrames);
-  const planMaxSec = storyClipTargetSec(model, fps, filmMaxFrames);
+  const planClips = flashStorySceneCount(targetMinutes);
   const skipSaveRef = useRef(true);
 
   useEffect(() => {
@@ -1569,7 +1983,6 @@ export const StoryWorkbench = forwardRef<
       setGate(cp.gate);
       setSource(cp.source === "story" ? "story" : "topic");
       setText(typeof cp.text === "string" ? cp.text : "");
-      setModel(cp.model === MODEL_FLASH ? MODEL_FLASH : MODEL_V20);
       setTargetMinutes(
         clampStoryMinutes(
           typeof cp.targetMinutes === "number" ? cp.targetMinutes : STORY_DEFAULT_MINUTES,
@@ -1607,18 +2020,27 @@ export const StoryWorkbench = forwardRef<
         );
       }
       setStory(typeof cp.story === "string" ? cp.story : "");
-      const nextScenes = cp.scenes.slice(0, STORY_SCENE_HARD_MAX).map((s) => ({
-        ...s,
-        cast: Array.isArray(s.cast) ? s.cast : [],
-        bridgeId: typeof s.bridgeId === "string" ? s.bridgeId : "",
-        bridgeUrl: typeof s.bridgeUrl === "string" ? s.bridgeUrl : "",
-        startId: typeof s.startId === "string" ? s.startId : "",
-        startUrl: typeof s.startUrl === "string" ? s.startUrl : "",
-        videoPrompt: typeof s.videoPrompt === "string" ? s.videoPrompt : "",
-        stillPrompt: typeof s.stillPrompt === "string" ? s.stillPrompt : "",
-        startPrompt: typeof s.startPrompt === "string" ? s.startPrompt : "",
-      }));
+      const nextScenes = stampShotModes(
+        cp.scenes.slice(0, STORY_SCENE_HARD_MAX).map((s) => ({
+          ...s,
+          cast: Array.isArray(s.cast) ? s.cast : [],
+          bridgeId: typeof s.bridgeId === "string" ? s.bridgeId : "",
+          bridgeUrl: typeof s.bridgeUrl === "string" ? s.bridgeUrl : "",
+          startId: typeof s.startId === "string" ? s.startId : "",
+          startUrl: typeof s.startUrl === "string" ? s.startUrl : "",
+          videoPrompt: typeof s.videoPrompt === "string" ? s.videoPrompt : "",
+          stillPrompt: typeof s.stillPrompt === "string" ? s.stillPrompt : "",
+          startPrompt: typeof s.startPrompt === "string" ? s.startPrompt : "",
+          imageModel: isImageModelId(s.imageModel) ? s.imageModel : DEFAULT_IMAGE_MODEL,
+          duration_sec: snapStoryDuration(s.duration_sec, MODEL_FLASH),
+          shotMode: isShotMode(s.shotMode) ? s.shotMode : ("" as ShotMode),
+          i2vRefs: parseStillRefs(s.i2vRefs),
+        })),
+      );
       setScenes(nextScenes);
+      setSelectedScene(0);
+      setBeatFocus("scene");
+      setInspectKind(null);
       const restored: Clip[] = nextScenes.map((_, i) => {
         const c = cp.clips[i] ?? { status: "waiting" as const };
         if (c.status === "generating" || c.status === "queued") {
@@ -1635,10 +2057,16 @@ export const StoryWorkbench = forwardRef<
         }
         return c;
       });
-      setClips(restored);
-      clipsRef.current = restored;
-      setMergeOrder(isPermutation(cp.mergeOrder, restored.length) ? cp.mergeOrder : identityOrder(restored.length));
-      lastCreateAtRef.current = typeof cp.lastCreateAt === "number" ? cp.lastCreateAt : 0;
+      if (cp.gate === "clips") {
+        setClips(restored);
+        clipsRef.current = restored;
+        setMergeOrder(isPermutation(cp.mergeOrder, restored.length) ? cp.mergeOrder : identityOrder(restored.length));
+        lastCreateAtRef.current = typeof cp.lastCreateAt === "number" ? cp.lastCreateAt : 0;
+      } else {
+        setClips([]);
+        clipsRef.current = [];
+        setMergeOrder([]);
+      }
     }
     skipSaveRef.current = false;
   }, []);
@@ -1646,7 +2074,7 @@ export const StoryWorkbench = forwardRef<
   useEffect(() => {
     if (gate !== "storyboard") return;
     if (scenes.length === 0 || characters.length === 0) return;
-    const needEnd = scenes.filter((_, i) => !sceneUsesSheetI2V(scenes, i));
+    const needEnd = scenes.filter((_, i) => !sceneIsI2V(scenes, i));
     const needStart = scenes.filter((_, i) => sceneNeedsGeneratedStart(scenes, i));
     if (
       (needEnd.length === 0 || needEnd.every((s) => s.bridgeUrl)) &&
@@ -1769,7 +2197,6 @@ export const StoryWorkbench = forwardRef<
     setGate("input");
     setSource("topic");
     setText("");
-    setModel(MODEL_V20);
     setTargetMinutes(STORY_DEFAULT_MINUTES);
     setV20Resolution(DEFAULT_V20_RESOLUTION);
     setFps(DEFAULT_FRAME_RATE);
@@ -1801,7 +2228,16 @@ export const StoryWorkbench = forwardRef<
     setSheetError(null);
     setStillBusy(false);
     setStillNote("");
+    setDrawingScenes([]);
+    setMobilePane("canvas");
     setStillErrors({});
+    setStartErrors({});
+    setSelectedScene(0);
+    setBeatFocus("wait");
+    setInspectKind(null);
+    setSelectedCast(null);
+    setAddModal(null);
+    setMoreOpen(false);
     bumpBridgeEpoch();
     clearCheckpoint();
   }
@@ -1818,48 +2254,6 @@ export const StoryWorkbench = forwardRef<
       resetAll();
     },
   }));
-
-  function snapDurations(nextModel: ModelId, nextFps: V20Fps, nextResolution: V20Resolution, nextAspect: V20FrameSizeId) {
-    const size = v20Size(nextResolution, nextAspect);
-    const maxFrames = maxFramesForPixels(size.width, size.height);
-    setScenes((prev) => {
-      if (prev.length === 0) return prev;
-      const anyCustom = prev.some((s) => s.durationTouched);
-      const nextScenes = prev.map((s) => ({
-        ...s,
-        duration_sec: snapStoryDuration(s.duration_sec, nextModel, nextFps, maxFrames),
-      }));
-      const changed = nextScenes.some((s, i) => s.duration_sec !== prev[i].duration_sec);
-      setModelSnapHint(
-        changed
-          ? anyCustom
-            ? "Custom durations were snapped to this resolution / fps / model."
-            : "Durations were snapped to this resolution / fps / model."
-          : null,
-      );
-      return nextScenes;
-    });
-  }
-
-  function changeModel(next: ModelId) {
-    setModel(next);
-    snapDurations(next, fps, v20Resolution, v20Aspect);
-  }
-
-  function changeResolution(next: V20Resolution) {
-    setV20Resolution(next);
-    snapDurations(model, fps, next, v20Aspect);
-  }
-
-  function changeFps(next: V20Fps) {
-    setFps(next);
-    snapDurations(model, next, v20Resolution, v20Aspect);
-  }
-
-  function changeV20Aspect(next: V20FrameSizeId) {
-    setV20Aspect(next);
-    snapDurations(model, fps, v20Resolution, next);
-  }
 
   async function storeMediaFile(
     file: File,
@@ -1888,7 +2282,9 @@ export const StoryWorkbench = forwardRef<
     setAssetStoring(true);
     setWriteError(null);
     try {
-      const room = STORY_IMAGE_LIBRARY_MAX - imageAssets.length;
+      const imageCap = gate === "input" ? STORY_COMPOSE_IMAGE_MAX : STORY_BOARD_IMAGE_MAX;
+      const used = gate === "input" ? imageAssets.length : libraryImageTotal(imageAssets, characters, scenes);
+      const room = imageCap - used;
       const picked = files.slice(0, Math.max(0, room));
       const added: StoryImageAsset[] = [];
       for (const file of picked) {
@@ -1902,9 +2298,10 @@ export const StoryWorkbench = forwardRef<
           selected: true,
           kind: "character",
           characterName: "",
+          sceneIndex: null,
         });
       }
-      if (added.length) setImageAssets((prev) => [...prev, ...added].slice(0, STORY_IMAGE_LIBRARY_MAX));
+      if (added.length) setImageAssets((prev) => [...prev, ...added].slice(0, imageCap));
     } catch {
       setWriteError("Could not store this file. Try again.");
     } finally {
@@ -1917,7 +2314,8 @@ export const StoryWorkbench = forwardRef<
     setAssetStoring(true);
     setWriteError(null);
     try {
-      const room = STORY_AUDIO_LIBRARY_MAX - audioAssets.length;
+      const audioCap = gate === "input" ? STORY_COMPOSE_AUDIO_MAX : STORY_BOARD_AUDIO_MAX;
+      const room = audioCap - audioAssets.length;
       const picked = files.slice(0, Math.max(0, room));
       const added: StoryAudioAsset[] = [];
       for (const file of picked) {
@@ -1932,7 +2330,7 @@ export const StoryWorkbench = forwardRef<
           sceneIndex: null,
         });
       }
-      if (added.length) setAudioAssets((prev) => [...prev, ...added].slice(0, STORY_AUDIO_LIBRARY_MAX));
+      if (added.length) setAudioAssets((prev) => [...prev, ...added].slice(0, audioCap));
     } catch {
       setWriteError("Could not store this file. Try again.");
     } finally {
@@ -2084,11 +2482,9 @@ export const StoryWorkbench = forwardRef<
       const payload: Record<string, unknown> = {
         source: sendSource,
         text: trimmed,
-        video_model: model,
+        video_model: MODEL_FLASH,
         target_minutes: targetMinutes,
-        frame_rate: fps,
-        resolution: v20Resolution,
-        aspect_ratio: model === MODEL_FLASH ? flashAspect : v20Aspect,
+        aspect_ratio: flashAspect,
       };
       const res = await fetch("/api/storyboard", {
         method: "POST",
@@ -2132,10 +2528,8 @@ export const StoryWorkbench = forwardRef<
         nextScenes.push({
           title: str("title") || `Scene ${nextScenes.length + 1}`,
           duration_sec: snapStoryDuration(
-            typeof rec.duration_sec === "number" ? rec.duration_sec : 5,
-            model,
-            fps,
-            filmMaxFrames,
+            typeof rec.duration_sec === "number" ? rec.duration_sec : FLASH_STORY_SECONDS,
+            MODEL_FLASH,
           ),
           durationTouched: false,
           cast,
@@ -2145,7 +2539,7 @@ export const StoryWorkbench = forwardRef<
           camera_movement: str("camera_movement"),
           lighting: str("lighting"),
           style: str("style"),
-          dialogue: str("dialogue") || "None.",
+          dialogue: normalizeDialogueJson(rec.dialogue),
           videoPrompt: "",
           stillPrompt: "",
           startPrompt: "",
@@ -2153,7 +2547,13 @@ export const StoryWorkbench = forwardRef<
           bridgeUrl: "",
           startId: "",
           startUrl: "",
+          imageModel: DEFAULT_IMAGE_MODEL,
+          shotMode: "keyframe",
+          i2vRefs: [],
         });
+      }
+      for (let i = 0; i < nextScenes.length; i += 1) {
+        nextScenes[i].shotMode = sceneUsesSheetI2V(nextScenes, i) ? "i2v" : "keyframe";
       }
       if (nextScenes.length < STORY_SCENE_MIN) {
         setWriteError(
@@ -2208,7 +2608,9 @@ export const StoryWorkbench = forwardRef<
       setSeed(nextSeed);
       seedRef.current = nextSeed;
       setScenes(nextScenes);
-      setTriedLooksGood(false);
+      setSelectedScene(0);
+      setBeatFocus("scene");
+      setInspectKind(null);
       setOpenScenes(new Set(nextScenes.length ? [0] : []));
       setModelSnapHint(null);
       bumpBridgeEpoch();
@@ -2216,9 +2618,8 @@ export const StoryWorkbench = forwardRef<
       setStartErrors({});
       setGate("storyboard");
       queueMicrotask(() => scenesHeadingRef.current?.focus());
-      void fetchAllSheets(bound.chars, style).then((drawn) => {
-        if (drawn.some((c) => c.stillUrl)) void fetchAllStills();
-      });
+      const drawn = await fetchAllSheets(bound.chars, style);
+      if (drawn.some((c) => c.stillUrl)) await fetchAllStills();
     } catch {
       setWriteError("Agnes is unavailable or the job was not found.");
     } finally {
@@ -2228,15 +2629,109 @@ export const StoryWorkbench = forwardRef<
 
   function dropScene(index: number) {
     if (scenes.length <= STORY_SCENE_MIN) return;
-    setScenes((prev) => prev.filter((_, i) => i !== index));
-    setOpenScenes((prev) => {
-      const next = new Set<number>();
-      for (const i of prev) {
-        if (i < index) next.add(i);
-        else if (i > index) next.add(i - 1);
-      }
+    setScenes((prev) => {
+      const next = prev.filter((_, i) => i !== index);
+      scenesRef.current = next;
       return next;
     });
+    setImageAssets((prev) =>
+      prev.map((img) => ({ ...img, sceneIndex: shiftSceneIndex(img.sceneIndex, index, -1) })),
+    );
+    setAudioAssets((prev) =>
+      prev.map((aud) => ({ ...aud, sceneIndex: shiftSceneIndex(aud.sceneIndex, index, -1) })),
+    );
+    if (gate === "clips") {
+      setClips((prev) => {
+        const next = prev.filter((_, i) => i !== index);
+        clipsRef.current = next;
+        return next;
+      });
+      setMergeOrder((prev) => identityOrder(Math.max(0, prev.length - 1)));
+      setMergedUrl(null);
+      setMergeChecked(false);
+    }
+    setSelectedScene((prev) => Math.max(0, prev === index ? index - 1 : prev > index ? prev - 1 : prev));
+    setInspectKind(null);
+  }
+
+  function insertBeat(form: AddSceneForm, generateClip: boolean) {
+    const at = Math.max(0, Math.min(scenesRef.current.length, Number(form.position)));
+    const draft = emptySceneDraft(filmStyle, characters[0] ? [characters[0].name] : []);
+    draft.title = form.title.trim() || "Untitled";
+    draft.duration_sec = snapStoryDuration(form.duration_sec, MODEL_FLASH);
+    draft.setting = form.setting.trim();
+    draft.subject = form.subject.trim();
+    draft.action = form.action.trim();
+    draft.shotMode = form.shotMode;
+    draft.imageModel = form.imageModel;
+    if (form.shotMode === "i2v") {
+      draft.i2vRefs = form.i2vRefs.slice(0, FLASH_IMAGE_MAX);
+      const first = draft.i2vRefs[0];
+      if (first) {
+        draft.startId = first.id;
+        draft.startUrl = first.url;
+      }
+    } else {
+      draft.startId = form.startId;
+      draft.startUrl = form.startUrl;
+      draft.startPrompt = form.startPrompt.trim();
+      draft.bridgeId = form.bridgeId;
+      draft.bridgeUrl = form.bridgeUrl;
+      draft.stillPrompt = form.stillPrompt.trim();
+    }
+    const nextScenes = scenesRef.current.slice();
+    nextScenes.splice(at, 0, draft);
+    const neighbor = nextScenes[at + 1];
+    let note = "";
+    if (neighbor && !sceneIsI2V(nextScenes, at + 1)) {
+      if (sceneIsI2V(nextScenes, at)) {
+        nextScenes[at + 1] = { ...neighbor, startId: "", startUrl: "", startPrompt: "" };
+        note = `S${at + 2} is keyframe after an I2V insert — drawing a new start still from that scene's story.`;
+      } else {
+        nextScenes[at + 1] = {
+          ...neighbor,
+          startId: draft.bridgeId,
+          startUrl: draft.bridgeUrl,
+        };
+        note = `S${at + 2} start still now uses the new scene's end still.`;
+      }
+    }
+    scenesRef.current = nextScenes;
+    setScenes(nextScenes);
+    setImageAssets((prev) =>
+      prev.map((img) => ({ ...img, sceneIndex: shiftSceneIndex(img.sceneIndex, at, 1) })),
+    );
+    setAudioAssets((prev) =>
+      prev.map((aud) => ({ ...aud, sceneIndex: shiftSceneIndex(aud.sceneIndex, at, 1) })),
+    );
+    setSelectedScene(at);
+    setBeatFocus("scene");
+    setInspectKind(null);
+    setMergedUrl(null);
+    setMergeChecked(false);
+    setBridgeNote(note);
+    if (note) {
+      window.setTimeout(() => {
+        setBridgeNote((cur) => (cur === note ? "" : cur));
+      }, 8000);
+    }
+    if (generateClip || gate === "clips") {
+      setClips((prev) => {
+        const next = prev.slice();
+        next.splice(at, 0, { status: "waiting" });
+        clipsRef.current = next;
+        return next;
+      });
+      setMergeOrder(identityOrder(nextScenes.length));
+    }
+    void (async () => {
+      const needNeighborStart =
+        sceneIsI2V(nextScenes, at) && at + 1 < nextScenes.length && !sceneIsI2V(nextScenes, at + 1);
+      if (needNeighborStart && gate !== "storyboard") {
+        await ensureStill(at + 1, "start", undefined, { replace: true });
+      }
+      if (generateClip) startQueue(at, false, at);
+    })();
   }
 
   function goBack() {
@@ -2414,7 +2909,7 @@ export const StoryWorkbench = forwardRef<
         const payload: Record<string, unknown> = {
           prompt,
           ratio: modelRef.current === MODEL_FLASH ? filmRef.current.flashAspect : filmRef.current.v20Aspect,
-          model: imageModelRef.current,
+          model: scene.imageModel || DEFAULT_IMAGE_MODEL,
           cast: sceneCastForStill(scene, roster).map((c) => c.name),
           validate: true,
         };
@@ -2479,11 +2974,12 @@ export const StoryWorkbench = forwardRef<
     const list = scenesRef.current;
     const jobs: { index: number; kind: "start" | "end" }[] = [];
     for (let i = 0; i < list.length; i += 1) {
-      if (!sceneUsesSheetI2V(list, i)) jobs.push({ index: i, kind: "end" });
-      if (sceneNeedsGeneratedStart(list, i)) jobs.push({ index: i, kind: "start" });
+      if (!sceneIsI2V(list, i) && !list[i]?.bridgeUrl) jobs.push({ index: i, kind: "end" });
+      if (sceneNeedsGeneratedStart(list, i) && !list[i]?.startUrl) jobs.push({ index: i, kind: "start" });
     }
     if (jobs.length === 0) return;
     setStillBusy(true);
+    setDrawingScenes(uniqueSceneIndexes(jobs));
     setStillNote(
       jobs.length === 1
         ? `Drawing ${jobs[0].kind === "start" ? "opening" : "end"} still for scene ${jobs[0].index + 1}…`
@@ -2496,6 +2992,7 @@ export const StoryWorkbench = forwardRef<
     } finally {
       setStillBusy(false);
       setStillNote("");
+      setDrawingScenes([]);
     }
   }
 
@@ -2505,6 +3002,7 @@ export const StoryWorkbench = forwardRef<
     stillGenRef.current.set(key, (stillGenRef.current.get(key) ?? 0) + 1);
     setStillErrorAt(index, null, kind);
     setStillBusy(true);
+    setDrawingScenes([index]);
     setStillNote(`Drawing ${kind === "start" ? "opening" : "end"} still for scene ${index + 1}…`);
     try {
       await ensureStill(index, kind, undefined, { replace: true });
@@ -2513,6 +3011,7 @@ export const StoryWorkbench = forwardRef<
     } finally {
       setStillBusy(false);
       setStillNote("");
+      setDrawingScenes([]);
     }
   }
 
@@ -2525,7 +3024,7 @@ export const StoryWorkbench = forwardRef<
         const image = stillJudgeSource(scene, "start");
         if (image) targets.push({ index, kind: "start", image, imageId: scene.startId });
       }
-      if (!sceneUsesSheetI2V(list, index)) {
+      if (!sceneIsI2V(list, index)) {
         const image = stillJudgeSource(scene, "end");
         if (image) targets.push({ index, kind: "end", image, imageId: scene.bridgeId });
       }
@@ -2535,6 +3034,7 @@ export const StoryWorkbench = forwardRef<
       return;
     }
     setStillBusy(true);
+    setDrawingScenes([]);
     setStillNote(`Checking ${targets.length} scene stills…`);
     try {
       const verdicts = await Promise.all(
@@ -2580,6 +3080,7 @@ export const StoryWorkbench = forwardRef<
         redraw.push({ index: item.index, kind: item.kind });
       }
       if (redraw.length > 0) {
+        setDrawingScenes(uniqueSceneIndexes(redraw));
         setStillNote(
           redraw.length === 1
             ? `Scene ${redraw[0].index + 1} failed gold standard — redrawing…`
@@ -2599,6 +3100,7 @@ export const StoryWorkbench = forwardRef<
     } finally {
       setStillBusy(false);
       setStillNote("");
+      setDrawingScenes([]);
     }
   }
 
@@ -2666,14 +3168,14 @@ export const StoryWorkbench = forwardRef<
         lastFrameSrc: undefined,
       });
 
-      const i2v = sceneUsesSheetI2V(list, i);
+      const i2v = sceneIsI2V(list, i);
       const needsStart = sceneNeedsGeneratedStart(list, i);
       let endFrame: string | undefined;
       let startFrame: string | undefined;
       if (!i2v) {
         const stillJobs: Promise<string | null>[] = [ensureStill(i, "end", signal)];
         if (needsStart) stillJobs.push(ensureStill(i, "start", signal));
-        else if (i > 0 && !sceneUsesSheetI2V(list, i - 1)) stillJobs.push(ensureStill(i - 1, "end", signal));
+        else if (i > 0 && !sceneIsI2V(list, i - 1)) stillJobs.push(ensureStill(i - 1, "end", signal));
         const [endUrl, startUrl] = await Promise.all(stillJobs);
         if (signal.aborted) break;
         endFrame = endUrl ?? undefined;
@@ -2695,7 +3197,7 @@ export const StoryWorkbench = forwardRef<
             });
             break;
           }
-        } else if (i > 0 && !sceneUsesSheetI2V(list, i - 1)) {
+        } else if (i > 0 && !sceneIsI2V(list, i - 1)) {
           startFrame = startUrl ?? undefined;
           if (!startFrame) {
             patchClip(i, {
@@ -2708,7 +3210,7 @@ export const StoryWorkbench = forwardRef<
         }
       }
       if (i + 1 < list.length) {
-        if (!sceneUsesSheetI2V(list, i + 1)) void ensureStill(i + 1, "end", signal);
+        if (!sceneIsI2V(list, i + 1)) void ensureStill(i + 1, "end", signal);
         if (sceneNeedsGeneratedStart(list, i + 1)) void ensureStill(i + 1, "start", signal);
       }
 
@@ -2751,13 +3253,13 @@ export const StoryWorkbench = forwardRef<
           );
       const seedNow = seedRef.current || 1;
       const film = filmRef.current;
-      const selectedImages = i === 0 ? selectedImageUrls(assetsRef.current.images) : [];
+      const selectedImages = selectedImageUrls(assetsRef.current.images, i);
       const selectedAudios = selectedAudioUrls(assetsRef.current.audios, i);
 
-      patchClip(i, { status: "generating", progress: undefined, error: undefined });
       const payload: Record<string, unknown> = {
         ...scenePayload(modelRef.current, prompt, scene.duration_sec, {
           sheets,
+          i2vRefs: (scene.i2vRefs ?? []).map((r) => r.url),
           startFrame,
           endFrame: endFrame ?? undefined,
           seed: seedNow,
@@ -2773,43 +3275,60 @@ export const StoryWorkbench = forwardRef<
       const typedKey = keyRef.current.trim();
       if (typedKey) payload.agnes_api_key = typedKey;
 
-      let createdId: string;
-      try {
-        const res = await fetch("/api/videos", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        lastCreateAtRef.current = Date.now();
-        if (res.status === 401) {
-          onAuthError();
-          patchClip(i, { status: "failed", error: "Add an Agnes API key in the header, or set AGNES_API_KEY in .env and restart.", resumeKind: "create" });
+      let createdId = "";
+      for (let attempt = 1; attempt <= STORY_CREATE_QUEUE_FULL_ATTEMPTS; attempt += 1) {
+        patchClip(i, { status: "generating", progress: undefined, error: undefined });
+        try {
+          const res = await fetch("/api/videos", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (res.status === 401) {
+            onAuthError();
+            patchClip(i, { status: "failed", error: "Add an Agnes API key in the header, or set AGNES_API_KEY in .env and restart.", resumeKind: "create" });
+            break;
+          }
+          if (!res.ok) {
+            const detail = await readDetail(res);
+            if (isAgnesCreateQueueFull(detail) && attempt < STORY_CREATE_QUEUE_FULL_ATTEMPTS) {
+              patchClip(i, { status: "queued", error: undefined });
+              const deadline = Date.now() + STORY_CREATE_QUEUE_FULL_WAIT_MS;
+              while (Date.now() < deadline) {
+                const remaining = deadline - Date.now();
+                setQueueNote(`Queue full. Next create in ~${Math.ceil(remaining / 1000)}s.`);
+                await sleep(Math.min(1000, remaining), signal);
+              }
+              continue;
+            }
+            setQueueNote("");
+            patchClip(i, { status: "failed", error: detail, resumeKind: "create" });
+            break;
+          }
+          onAuthOk();
+          const body: unknown = await res.json();
+          const videoId =
+            typeof body === "object" &&
+            body !== null &&
+            "video_id" in body &&
+            typeof (body as { video_id: unknown }).video_id === "string"
+              ? (body as { video_id: string }).video_id
+              : "";
+          if (!videoId) {
+            patchClip(i, { status: "failed", error: "Agnes is unavailable or the job was not found.", resumeKind: "create" });
+            break;
+          }
+          lastCreateAtRef.current = Date.now();
+          createdId = videoId;
           break;
-        }
-        if (!res.ok) {
-          patchClip(i, { status: "failed", error: await readDetail(res), resumeKind: "create" });
-          break;
-        }
-        onAuthOk();
-        const body: unknown = await res.json();
-        const videoId =
-          typeof body === "object" &&
-          body !== null &&
-          "video_id" in body &&
-          typeof (body as { video_id: unknown }).video_id === "string"
-            ? (body as { video_id: string }).video_id
-            : "";
-        if (!videoId) {
+        } catch (err) {
+          if (isAbort(err)) break;
           patchClip(i, { status: "failed", error: "Agnes is unavailable or the job was not found.", resumeKind: "create" });
           break;
         }
-        createdId = videoId;
-      } catch (err) {
-        if (isAbort(err)) break;
-        patchClip(i, { status: "failed", error: "Agnes is unavailable or the job was not found.", resumeKind: "create" });
-        break;
       }
+      if (signal.aborted || !createdId) break;
 
       patchClip(i, { videoId: createdId });
       inflight.push(pollClip(i, createdId, signal));
@@ -2871,7 +3390,7 @@ export const StoryWorkbench = forwardRef<
     }
     const needEnd = scenesRef.current
       .map((_, i) => i)
-      .filter((i) => !sceneUsesSheetI2V(scenesRef.current, i));
+      .filter((i) => !sceneIsI2V(scenesRef.current, i));
     const needStart = scenesRef.current
       .map((_, i) => i)
       .filter((i) => sceneNeedsGeneratedStart(scenesRef.current, i));
@@ -2895,7 +3414,7 @@ export const StoryWorkbench = forwardRef<
     }
     const snapped = scenes.map((s) => ({
       ...s,
-      duration_sec: snapStoryDuration(s.duration_sec, model, fps, filmMaxFrames),
+      duration_sec: snapStoryDuration(s.duration_sec, MODEL_FLASH),
     }));
     scenesRef.current = snapped;
     setScenes(snapped);
@@ -2955,49 +3474,25 @@ export const StoryWorkbench = forwardRef<
     }
   }
 
-  const current = pipelineCurrent(gate, clips, mergedUrl);
   const allReady = clips.length > 0 && clips.every((c) => c.status === "ready");
   const generatingIndex = clips.findIndex((c) => c.status === "generating");
   const queueRunning = clips.some((c) => c.status === "generating" || c.status === "queued");
   const failedIndex = clips.findIndex((c) => c.status === "failed");
-
-  const filmBlock = (idPrefix: string) => (
-    <FilmSettings
-      idPrefix={idPrefix}
-      model={model}
-      resolution={v20Resolution}
-      fps={fps}
-      v20Aspect={v20Aspect}
-      flashAspect={flashAspect}
-      onResolution={changeResolution}
-      onFps={changeFps}
-      onV20Aspect={changeV20Aspect}
-      onFlashAspect={setFlashAspect}
-    />
-  );
-
-  const assetsBlock = (idPrefix: string) => (
-    <AssetLibrary
-      idPrefix={idPrefix}
-      disabled={writing || sheetBusy}
-      storing={assetStoring}
-      characters={characters}
-      sceneCount={scenes.length}
-      imageAssets={imageAssets}
-      audioAssets={audioAssets}
-      model={model}
-      onPickImages={(files) => void uploadImageFiles(files)}
-      onPickAudios={(files) => void uploadAudioFiles(files)}
-      onPatchImage={(key, patch) =>
-        setImageAssets((prev) => prev.map((img) => (img.key === key ? { ...img, ...patch } : img)))
-      }
-      onPatchAudio={(key, patch) =>
-        setAudioAssets((prev) => prev.map((aud) => (aud.key === key ? { ...aud, ...patch } : aud)))
-      }
-      onRemoveImage={(key) => setImageAssets((prev) => prev.filter((img) => img.key !== key))}
-      onRemoveAudio={(key) => setAudioAssets((prev) => prev.filter((aud) => aud.key !== key))}
-    />
-  );
+  const studioMode: StudioMode =
+    gate === "clips" ? "playback" : gate === "storyboard" ? "board" : "compose";
+  const imageCap = studioMode === "compose" ? STORY_COMPOSE_IMAGE_MAX : STORY_BOARD_IMAGE_MAX;
+  const audioCap = studioMode === "compose" ? STORY_COMPOSE_AUDIO_MAX : STORY_BOARD_AUDIO_MAX;
+  const genStills = generatedImageAliases(characters, scenes);
+  const imageCount = studioMode === "compose" ? imageAssets.length : libraryImageTotal(imageAssets, characters, scenes);
+  const scene = scenes[selectedScene];
+  const clip = clips[selectedScene];
+  const sheetI2V = scene ? sceneIsI2V(scenes, selectedScene) : false;
+  const needsStart = scene ? sceneNeedsGeneratedStart(scenes, selectedScene) : false;
+  const pipelineBusy =
+    writing || sheetBusy || (stillBusy && clips.length === 0 && drawingScenes.length !== 1);
+  const bootStep = stillBusy ? "stills" : sheetBusy ? "sheets" : "storyboard";
+  const bootCopy = stillNote || sheetNote || "Writing the storyboard…";
+  const sheetNames = characters.map((c) => c.name.trim()).filter(Boolean);
 
   function queueLive(): string {
     if (stillBusy || stillNote) return stillNote || "Working on scene stills…";
@@ -3025,15 +3520,407 @@ export const StoryWorkbench = forwardRef<
     void writeStoryboard();
   }
 
-  return (
-    <div className="story-root" style={!active ? { display: "none" } : undefined} aria-hidden={!active}>
-      <Pipeline current={current} onBack={gate === "input" ? null : goBack} />
+  function requestMode(next: StudioMode) {
+    if (next === "compose") {
+      setGate("input");
+      setBeatFocus("wait");
+      setInspectKind(null);
+      return;
+    }
+    if (next === "board") {
+      if (scenes.length < STORY_SCENE_MIN) return;
+      if (gate === "clips") {
+        if (!window.confirm("This throws away generated clips. Storyboard stays.")) return;
+        stopQueue();
+        setClips([]);
+        clipsRef.current = [];
+        setMergeOrder([]);
+        setMergeChecked(false);
+        setMerging(false);
+        setMergeError(null);
+        setMergedUrl(null);
+        setQueueNote("");
+      }
+      setGate("storyboard");
+      setBeatFocus(scene ? "scene" : "wait");
+      setInspectKind(null);
+      return;
+    }
+    if (clips.length === 0) return;
+    setGate("clips");
+    setBeatFocus("scene");
+    setInspectKind(null);
+  }
 
-      {gate === "input" ? (
-        <div className="layout layout-input">
-          <form className="request" onSubmit={onWriteSubmit} noValidate>
-            <h2 className="block">Source</h2>
-            <fieldset className="seg" style={{ border: 0, margin: "0 0 0.9rem" }}>
+  function onCta() {
+    if (studioMode === "compose") {
+      void writeStoryboard();
+      return;
+    }
+    if (studioMode === "board") {
+      void looksGood();
+      return;
+    }
+    if (mergedUrl) {
+      window.open(mergedUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    void mergeClips();
+  }
+
+  const ctaDisabled =
+    studioMode === "compose"
+      ? writing || assetStoring
+      : studioMode === "board"
+        ? writing ||
+          sheetBusy ||
+          assetStoring ||
+          stillBusy ||
+          characters.length === 0 ||
+          characters.some((c) => !c.stillUrl) ||
+          scenes.some((s) => !shotReady(s))
+        : mergedUrl
+          ? false
+          : !allReady || !mergeChecked || merging;
+
+  const ctaLabel =
+    studioMode === "compose"
+      ? writing
+        ? "Writing…"
+        : "Write storyboard"
+      : studioMode === "board"
+        ? "Looks good"
+        : mergedUrl
+          ? "Download MP4"
+          : merging
+            ? "Merging…"
+            : "Merge clips";
+
+  function stillTiles(): { src: string; label: string; kind: "start" | "end" | "sheet"; index: number }[] {
+    if (!scene) return [];
+    if (sheetI2V) {
+      const refs = (scene.i2vRefs ?? []).filter((r) => r.url || r.id);
+      if (refs.length > 0) {
+        return refs.map((ref, i) => ({
+          src: mediaPreview(ref.id, ref.url),
+          label: `Ref ${i + 1}`,
+          kind: "start" as const,
+          index: selectedScene,
+        }));
+      }
+      const wanted = (scene.cast ?? []).map((n) => n.toLowerCase());
+      const castSheets = (
+        wanted.length > 0 ? characters.filter((c) => wanted.includes(c.name.toLowerCase())) : characters
+      ).filter((c) => c.stillUrl || c.stillId);
+      return castSheets.map((ch, i) => ({
+        src: mediaPreview(ch.stillId, ch.stillUrl),
+        label: `Sheet · ${ch.name}`,
+        kind: "sheet" as const,
+        index: characters.findIndex((c) => c.name === ch.name) >= 0 ? characters.findIndex((c) => c.name === ch.name) : i,
+      }));
+    }
+    const tiles: { src: string; label: string; kind: "start" | "end" | "sheet"; index: number }[] = [];
+    const prev = selectedScene > 0 ? scenes[selectedScene - 1] : null;
+    const startSrc = needsStart
+      ? mediaPreview(scene.startId, scene.startUrl)
+      : prev
+        ? mediaPreview(prev.bridgeId, prev.bridgeUrl)
+        : "";
+    if (startSrc) {
+      tiles.push({
+        src: startSrc,
+        label: "Start still",
+        kind: needsStart ? "start" : "end",
+        index: needsStart ? selectedScene : selectedScene - 1,
+      });
+    }
+    const endSrc = mediaPreview(scene.bridgeId, scene.bridgeUrl);
+    if (endSrc) tiles.push({ src: endSrc, label: "End still", kind: "end", index: selectedScene });
+    return tiles;
+  }
+
+  const boardStillTiles = stillTiles();
+  const inspectorTitle =
+    beatFocus === "cast" && selectedCast != null
+      ? "Character"
+      : inspectKind === "start" || inspectKind === "end"
+        ? "Scene images"
+        : scene
+          ? "Scene"
+          : "Details";
+
+  function openInspector(kind: "sheet" | "start" | "end", index: number) {
+    if (studioMode === "compose") return;
+    setInspectKind(kind);
+    if (kind === "sheet") {
+      setSelectedCast(index);
+      setBeatFocus("cast");
+    } else {
+      setSelectedScene(index);
+      setBeatFocus("scene");
+    }
+    if (isPhoneStory()) setMobilePane("details");
+  }
+
+  const mappedImages = imageAssets.filter(
+    (img) => img.selected && (img.sceneIndex === null || img.sceneIndex === selectedScene),
+  );
+  const mappedAudios = audioAssets.filter(
+    (a) => a.selected && (a.sceneIndex === null || a.sceneIndex === selectedScene),
+  );
+
+  return (
+    <div
+      className="story-root"
+      data-mode={studioMode}
+      data-pane={mobilePane}
+      style={!active ? { display: "none" } : undefined}
+      aria-hidden={!active}
+    >
+      <header className="story-topbar story-glass">
+        <div className="story-brand">
+          <span className="story-mark" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M5 12h14M12 5v14" />
+            </svg>
+          </span>
+          <b>Agnes</b>
+        </div>
+        <div className="story-proj" title={text || story || "New sequence"}>
+          {text.trim() || story.trim() || "New sequence"}
+        </div>
+        <span className="story-chip">{formatStoryLength(totalSec || targetMinutes * 60)}</span>
+        <div className="story-modes" role="group" aria-label="Editor mode">
+          {(["compose", "board", "playback"] as StudioMode[]).map((id) => (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={studioMode === id}
+              disabled={
+                (id === "board" && scenes.length < STORY_SCENE_MIN) ||
+                (id === "playback" && clips.length === 0)
+              }
+              onClick={() => requestMode(id)}
+            >
+              {id === "compose" ? "Compose" : id === "board" ? "Board" : "Playback"}
+            </button>
+          ))}
+        </div>
+        <div className="story-menu-wrap">
+          <button
+            type="button"
+            className="story-icon-btn"
+            aria-haspopup="true"
+            aria-expanded={moreOpen}
+            aria-label="More actions"
+            onClick={() => setMoreOpen((v) => !v)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <circle cx="6" cy="12" r="1.7" />
+              <circle cx="12" cy="12" r="1.7" />
+              <circle cx="18" cy="12" r="1.7" />
+            </svg>
+          </button>
+          <div className={`story-menu story-glass${moreOpen ? " is-on" : ""}`}>
+            {studioMode === "board" ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setMoreOpen(false);
+                  if (!window.confirm("Replace these scenes? Edits go away. Clips have not started.")) return;
+                  void writeStoryboard(true);
+                }}
+              >
+                Rewrite board
+              </button>
+            ) : null}
+            {studioMode !== "compose" ? (
+              <button
+                type="button"
+                disabled={stillBusy || !scenes.some((s) => s.bridgeUrl || s.startUrl)}
+                onClick={() => {
+                  setMoreOpen(false);
+                  void checkAndFixStills();
+                }}
+              >
+                Check &amp; fix stills
+              </button>
+            ) : null}
+          </div>
+        </div>
+        <label className="story-confirm">
+          <input
+            type="checkbox"
+            checked={mergeChecked}
+            disabled={!allReady || merging || Boolean(mergedUrl)}
+            onChange={(e) => setMergeChecked(e.target.checked)}
+          />
+          These clips are correct
+        </label>
+        <button type="button" className="story-abort" disabled={!queueRunning} onClick={() => stopQueue(true)}>
+          Abort
+        </button>
+        <button type="button" className="story-cta" disabled={ctaDisabled} onClick={onCta}>
+          {ctaLabel}
+        </button>
+      </header>
+
+      <div className="story-pane-tabs" role="tablist" aria-label="Studio pane">
+        {(
+          [
+            ["canvas", "Canvas"],
+            ["library", "Library"],
+            ["details", "Details"],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={mobilePane === id}
+            onClick={() => setMobilePane(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="story-studio" ref={studioRef}>
+        <aside className="story-bin story-glass" aria-label="Library">
+          <div className="story-pane-h">Library</div>
+          <div className="story-bin-body">
+            <details className="story-sec" open>
+              <summary>Cast</summary>
+              {characters.length === 0 ? <p className="story-hint">Cast appears after Write.</p> : null}
+              {characters.map((ch, index) => (
+                <button
+                  key={`cast-${index}`}
+                  type="button"
+                  className={`story-asset${beatFocus === "cast" && selectedCast === index ? " is-on" : ""}`}
+                  onClick={() => {
+                    if (studioMode === "compose") return;
+                    setSelectedCast(index);
+                    setBeatFocus("cast");
+                    setInspectKind("sheet");
+                    if (isPhoneStory()) setMobilePane("details");
+                  }}
+                >
+                  {ch.stillUrl || ch.stillId ? (
+                    <StoryCachedImg className="story-thumb" src={mediaPreview(ch.stillId, ch.stillUrl)} alt="" />
+                  ) : (
+                    <span className="story-thumb" />
+                  )}
+                  <div>
+                    <b>{ch.name}</b>
+                    <small>{ch.role || "character"}</small>
+                  </div>
+                </button>
+              ))}
+            </details>
+            <details className="story-sec" open>
+              <summary>
+                Stills <span className="story-count">{imageCount}/{imageCap}</span>
+              </summary>
+              <div className="story-subtabs" role="tablist" aria-label="Stills source">
+                <button type="button" aria-selected={stillTab === "up"} onClick={() => setStillTab("up")}>
+                  Uploaded
+                </button>
+                <button type="button" aria-selected={stillTab === "gen"} onClick={() => setStillTab("gen")}>
+                  Generated
+                </button>
+              </div>
+              {stillTab === "up" ? (
+                <>
+                  <label className="story-tiny story-upload">
+                    Add images
+                    <input
+                      type="file"
+                      accept={IMAGE_ACCEPT}
+                      multiple
+                      disabled={writing || assetStoring || imageCount >= imageCap}
+                      onChange={(e) => {
+                        const files = Array.from(e.target.files ?? []);
+                        e.target.value = "";
+                        void uploadImageFiles(files);
+                      }}
+                    />
+                  </label>
+                  <div className="story-thumb-grid">
+                    {imageAssets.map((img) => (
+                      <StoryCachedImg
+                        key={img.key}
+                        className="story-mini-still"
+                        src={mediaPreview(img.id, img.url)}
+                        alt={img.name}
+                      />
+                    ))}
+                  </div>
+                </>
+              ) : genStills.length === 0 ? (
+                <p className="story-hint">Generated sheets appear after Write storyboard.</p>
+              ) : (
+                genStills.map((item) => {
+                  const key = `${item.regen.kind}-${item.regen.index}`;
+                  const on = inspectKind === item.regen.kind && item.regen.index ===
+                    (item.regen.kind === "sheet" ? selectedCast : selectedScene);
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`story-asset${on ? " is-on" : ""}`}
+                      onClick={() => openInspector(item.regen.kind, item.regen.index)}
+                    >
+                      <StoryCachedImg className="story-thumb" src={item.url} alt="" />
+                      <div>
+                        <b>{item.name}</b>
+                        <small>
+                          {item.regen.kind === "sheet"
+                            ? "Character sheet"
+                            : item.regen.kind === "start"
+                              ? "Start still"
+                              : "End still"}
+                        </small>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </details>
+            <details className="story-sec" open>
+              <summary>
+                Audio <span className="story-count">{audioAssets.length}/{audioCap}</span>
+              </summary>
+              <label className="story-tiny story-upload">
+                Add audio
+                <input
+                  type="file"
+                  accept={AUDIO_ACCEPT}
+                  multiple
+                  disabled={writing || assetStoring || audioAssets.length >= audioCap}
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files ?? []);
+                    e.target.value = "";
+                    void uploadAudioFiles(files);
+                  }}
+                />
+              </label>
+              {audioAssets.map((aud) => (
+                <div className="story-audio-chip" key={aud.key}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                    <path d="M4 12h3l5-6v12l-5-6H4z" />
+                  </svg>
+                  {aud.name}
+                </div>
+              ))}
+            </details>
+          </div>
+        </aside>
+
+        <section className="story-stage story-glass" aria-label="Canvas">
+          <div className="story-stage-glow" aria-hidden="true" />
+          <form className="story-composer story-glass" onSubmit={onWriteSubmit} noValidate>
+            <h2>New sequence</h2>
+            <fieldset className="seg" style={{ border: 0, margin: "0 0 0.6rem" }}>
               <legend className="visually-hidden">Source</legend>
               <label>
                 <input
@@ -3053,849 +3940,557 @@ export const StoryWorkbench = forwardRef<
                   checked={source === "story"}
                   onChange={() => setSource("story")}
                 />
-                <span>Paste story</span>
+                <span>Paste</span>
               </label>
             </fieldset>
-
-            {source === "topic" ? (
-              <div className="row">
-                <label className="field" htmlFor="story-topic">
-                  Topic{" "}
-                  <abbr className="req" title="required">
-                    *
-                  </abbr>
+            <label className="story-field" htmlFor="story-topic">
+              {source === "topic" ? "Topic" : "Story"}
+            </label>
+            <textarea
+              id="story-topic"
+              className={source === "story" ? "textarea-story" : undefined}
+              rows={source === "story" ? 8 : 3}
+              required
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+            />
+            <div className="story-pair story-compose-meta">
+              <div>
+                <label className="story-field" htmlFor="story-minutes">
+                  Length
                 </label>
-                <textarea
-                  id="story-topic"
-                  className="textarea-compact"
-                  rows={3}
-                  required
-                  value={text}
-                  onChange={(e) => setText(e.target.value)}
-                />
-                <p className="hint">Same language as you type. One short film, not a series.</p>
+                <select
+                  id="story-minutes"
+                  value={targetMinutes}
+                  onChange={(e) => setTargetMinutes(Number(e.target.value))}
+                >
+                  {STORY_MINUTES_OPTIONS.map((m) => (
+                    <option key={m} value={m}>
+                      {m} min
+                    </option>
+                  ))}
+                </select>
               </div>
-            ) : (
-              <div className="row">
-                <label className="field" htmlFor="story-paste">
-                  Story{" "}
-                  <abbr className="req" title="required">
-                    *
-                  </abbr>
-                </label>
-                <textarea
-                  id="story-paste"
-                  className="textarea-story"
-                  rows={10}
-                  required
-                  value={text}
-                  onChange={(e) => setText(e.target.value)}
-                />
-                <p className="hint">
-                  Keep your intent. The model tightens for picture, then splits scenes. You still confirm.
-                </p>
+              <div>
+                <p className="story-field">Aspect</p>
+                <FlashAspectPills name="story-aspect" value={flashAspect} onChange={setFlashAspect} />
               </div>
-            )}
-
-            <ModelRadios name="story-model-input" model={model} onChange={changeModel} />
-            {filmBlock("story-input")}
-
-            <div className="row">
-              <label className="field" htmlFor="story-minutes">
-                Film length{" "}
-                <abbr className="req" title="required">
-                  *
-                </abbr>
-              </label>
-              <select
-                id="story-minutes"
-                className="story-minutes"
-                value={targetMinutes}
-                onChange={(e) => setTargetMinutes(Number(e.target.value))}
-              >
-                {STORY_MINUTES_OPTIONS.map((m) => (
-                  <option key={m} value={m}>
-                    {m} min
-                  </option>
-                ))}
-              </select>
-              <p className="hint">
-                {model === MODEL_FLASH
-                  ? `Total film, not one Agnes call. Every Flash scene is ${FLASH_STORY_SECONDS}s (model hard max), so about ${planRange.min} clips for ${targetMinutes} min.`
-                  : `Total film, not one Agnes call. Clip length follows each beat (${planMinSec}–${planMaxSec}s at this resolution / fps), not always max. About ${planRange.min}–${planRange.max} clips.`}{" "}
-                Free accounts: about one create every 65s; previous clips can keep generating.
-              </p>
             </div>
-
-            {assetsBlock("story-input")}
-
-            <div className="generate-bar">
-              <button type="submit" className="btn btn-primary" disabled={writing || assetStoring}>
-                {writing ? "Writing…" : "Write storyboard"}
-              </button>
-              {writeError ? <p className="form-error">{writeError}</p> : null}
-              <p className="hint">No Agnes create yet.</p>
-            </div>
+            <p className="story-hint">
+              About {planClips} clips · {FLASH_STORY_SECONDS}s default. Total film, not one Agnes call.
+            </p>
+            {writeError ? <p className="form-error">{writeError}</p> : null}
           </form>
-
-          <aside className="job" aria-labelledby="storyboard-well-heading">
-            <h2 className="block" id="storyboard-well-heading">
-              Storyboard
-            </h2>
-            <div className="job-well" aria-busy={writing}>
-              {writing ? (
-                <div className="job-run">
-                  <span className="spin" aria-hidden="true" />
-                  <p className="job-line sr-status" aria-live="polite" aria-atomic="true">
-                    Writing storyboard… then a spritesheet per character.
-                  </p>
-                </div>
-              ) : writeError ? (
-                <p className="form-error">{writeError}</p>
+          <div className="story-viewer">
+            <span className="story-badge">
+              {sheetI2V ? "I2V" : "Keyframe"}
+            </span>
+            <div
+              className={`story-stills${sheetI2V ? " sheets" : ""}`}
+              data-count={String(Math.min(Math.max(boardStillTiles.length, 1), 3))}
+            >
+              {boardStillTiles.map((tile) => (
+                <button
+                  key={`${tile.kind}-${tile.index}-${tile.label}`}
+                  type="button"
+                  className="story-still"
+                  onClick={() => openInspector(tile.kind, tile.index)}
+                >
+                  <StoryCachedImg src={tile.src} alt="" />
+                  <span className="story-still-chip">{tile.label}</span>
+                </button>
+              ))}
+            </div>
+            <div className="story-player-wrap">
+              {mergedUrl ? <span className="story-merged-note">Merged sequence</span> : null}
+              {mergedUrl ? (
+                <video ref={mergedPlayerRef} src={mergedUrl} controls playsInline tabIndex={-1} />
+              ) : clip?.url ? (
+                <video src={clip.url} controls playsInline />
               ) : (
-                <p className="hint">
-                  Topic or paste. The model writes or refines, then you confirm scenes. No video until you say so.
-                </p>
+                <p className="story-hint">{queueLive()}</p>
               )}
             </div>
-          </aside>
-        </div>
-      ) : null}
-
-      {gate === "storyboard" ? (
-        <div className="layout">
-          <div className="request">
-            <h2 className="block">Story</h2>
-            <div className="row">
-              <label className="visually-hidden" htmlFor="story-prose">
-                Story
-              </label>
-              <textarea
-                id="story-prose"
-                className="textarea-story"
-                rows={12}
-                value={story}
-                onChange={(e) => setStory(e.target.value)}
-              />
-              <p className="hint">
-                {wordCount(story)} words · same language
-              </p>
+          </div>
+          <div className={`story-overlay${pipelineBusy ? " is-on" : ""}`} aria-live="polite">
+            <div className="story-boot">
+              <span className="story-boot-spin" aria-hidden="true" />
+              <p className="story-boot-copy">{bootCopy}</p>
+              <ol className="story-boot-steps">
+                <li className={bootStep === "storyboard" ? "is-on" : "is-done"}>Storyboard</li>
+                <li className={bootStep === "sheets" ? "is-on" : bootStep === "stills" ? "is-done" : ""}>
+                  Sheets{sheetNames.length > 0 ? ` · ${sheetNames.join(", ")}` : ""}
+                </li>
+                <li className={bootStep === "stills" ? "is-on" : ""}>Scene stills</li>
+              </ol>
             </div>
-            <p className="hint">
-              TOTAL {scenes.length} scenes · {formatStoryLength(totalSec)}
-              {seed !== null ? ` · seed ${seed}` : ""}
-            </p>
-            <p className="hint">
-              Free ~1 create / 65s. Next clip can start while the previous is still generating. Same seed.
-              Each person has a labeled model sheet with their name on it. Cuts share a landing still.
-              The video is a live scene, not the sheet.
-            </p>
-            <h2 className="block">Characters</h2>
-            <p className="hint">
-              Up to {STORY_CHARACTER_MAX} main people. Separate labeled model sheet each, with the name printed
-              on the sheet so video can map them. Never a group image.
-            </p>
-            {sheetBusy ? (
-              <div className="job-run">
-                <span className="spin" aria-hidden="true" />
-                <p className="job-line">{sheetNote || "Drawing spritesheets…"}</p>
+          </div>
+        </section>
+
+        <aside className="story-beat story-glass" id="beat-pane" aria-label={inspectorTitle}>
+          <button
+            type="button"
+            className="story-grip"
+            aria-label={`Resize ${inspectorTitle} pane`}
+            onPointerDown={(e) => {
+              beatDragRef.current = e.clientX;
+              e.currentTarget.setPointerCapture(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              if (beatDragRef.current == null) return;
+              const studio = studioRef.current;
+              if (!studio) return;
+              const max = studio.clientWidth * 0.5;
+              const styles = getComputedStyle(e.currentTarget.closest(".story-root") as HTMLElement);
+              const cur = parseFloat(styles.getPropertyValue("--story-beat-w")) || 360;
+              const next = Math.min(max, Math.max(260, cur - (e.clientX - beatDragRef.current)));
+              beatDragRef.current = e.clientX;
+              (e.currentTarget.closest(".story-root") as HTMLElement).style.setProperty(
+                "--story-beat-w",
+                `${next}px`,
+              );
+            }}
+            onPointerUp={() => {
+              beatDragRef.current = null;
+            }}
+          >
+            <span />
+          </button>
+          <div className="story-pane-h">{inspectorTitle}</div>
+          <div className="story-beat-scroll">
+            {studioMode === "compose" || !scene ? (
+              <div className="story-wait">
+                <p>Write a storyboard to edit a scene.</p>
               </div>
-            ) : null}
-            {sheetError ? <p className="form-error">{sheetError}</p> : null}
-            {characters.map((ch, index) => (
-              <div className="scene-slot character-card" key={`cast-${index}`}>
-                {ch.stillId || ch.stillUrl ? (
-                  <ZoomableImage
-                    src={mediaPreview(ch.stillId, ch.stillUrl)}
-                    alt={`${ch.name} spritesheet`}
-                    onZoom={openZoom}
-                  />
-                ) : (
-                  <p className="hint">Spritesheet pending.</p>
-                )}
-                <div className="row">
-                  <label className="field" htmlFor={`character-name-${index}`}>
-                    Name
-                  </label>
-                  <input
-                    id={`character-name-${index}`}
-                    type="text"
-                    value={ch.name}
-                    onChange={(e) => {
-                      const name = e.target.value;
-                      const prevName = ch.name;
-                      setCharacters((prev) => prev.map((c, i) => (i === index ? { ...c, name } : c)));
-                      if (prevName) {
-                        setImageAssets((prev) =>
-                          prev.map((img) =>
-                            img.characterName === prevName ? { ...img, characterName: name } : img,
-                          ),
-                        );
-                      }
-                    }}
-                  />
-                </div>
-                <p className="hint">{ch.role || "character"}</p>
-                <div className="row">
-                  <label className="field" htmlFor={`character-look-${index}`}>
-                    Appearance
-                  </label>
-                  <textarea
-                    id={`character-look-${index}`}
-                    className="prompt-short"
-                    rows={3}
-                    value={ch.appearance}
-                    onChange={(e) => {
-                      const appearance = e.target.value;
-                      setCharacters((prev) =>
-                        prev.map((c, i) => (i === index ? { ...c, appearance } : c)),
+            ) : beatFocus === "cast" && selectedCast != null && characters[selectedCast] ? (
+              <>
+                <p className="story-kicker">Cast</p>
+                <h3>{characters[selectedCast].name}</h3>
+                <label className="story-field" htmlFor="beat-cast-name">
+                  Name
+                </label>
+                <input
+                  id="beat-cast-name"
+                  type="text"
+                  value={characters[selectedCast].name}
+                  onChange={(e) => {
+                    const name = e.target.value;
+                    const prevName = characters[selectedCast].name;
+                    patchCharacter(selectedCast, { name });
+                    if (prevName) {
+                      setImageAssets((prev) =>
+                        prev.map((img) =>
+                          img.characterName === prevName ? { ...img, characterName: name } : img,
+                        ),
                       );
-                    }}
-                  />
-                </div>
-                <div className="row">
-                  <label className="field" htmlFor={`character-sample-${index}`}>
-                    Sample image
-                  </label>
-                  {ch.sampleUrl ? (
-                    <ZoomableImage
-                      src={mediaPreview(ch.sampleId, ch.sampleUrl)}
-                      alt={`${ch.name} sample`}
-                      onZoom={openZoom}
-                    />
-                  ) : null}
-                  <input
-                    id={`character-sample-${index}`}
-                    type="file"
-                    accept={IMAGE_ACCEPT}
-                    disabled={sheetBusy || writing || assetStoring}
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      e.target.value = "";
-                      void uploadCharacterSample(index, file);
-                    }}
-                  />
-                  {ch.sampleName ? (
-                    <p className="hint sample-meta">
-                      Using {ch.sampleName}{" "}
-                      <button
-                        type="button"
-                        className="btn btn-ghost sample-clear"
-                        disabled={sheetBusy || writing}
-                        onClick={() =>
-                          patchCharacter(index, { sampleId: "", sampleUrl: "", sampleName: "" })
+                    }
+                  }}
+                />
+                <label className="story-field" htmlFor="beat-cast-look">
+                  Appearance
+                </label>
+                <textarea
+                  id="beat-cast-look"
+                  value={characters[selectedCast].appearance}
+                  onChange={(e) => patchCharacter(selectedCast, { appearance: e.target.value })}
+                />
+                <ImageModelSelect
+                  id="beat-cast-model"
+                  value={characters[selectedCast].imageModel}
+                  onChange={(imageModel) => patchCharacter(selectedCast, { imageModel })}
+                />
+                <label className="story-field" htmlFor="beat-cast-prompt">
+                  Prompt
+                </label>
+                <textarea
+                  id="beat-cast-prompt"
+                  value={characters[selectedCast].generatePrompt}
+                  placeholder="Optional prompt for this sheet"
+                  onChange={(e) => patchCharacter(selectedCast, { generatePrompt: e.target.value })}
+                />
+                <button
+                  type="button"
+                  className="story-tiny"
+                  disabled={sheetBusy}
+                  onClick={() => void regenOneSheet(selectedCast)}
+                >
+                  {sheetBusy ? "Drawing…" : "Regenerate"}
+                </button>
+                {sheetError ? <p className="form-error">{sheetError}</p> : null}
+              </>
+            ) : scene && (inspectKind === "start" || inspectKind === "end") ? (
+              <>
+                <p className="story-kicker">
+                  S{selectedScene + 1} of {scenes.length}
+                </p>
+                <h3>{inspectKind === "start" ? "Start still" : "End still"}</h3>
+                <label className="story-field" htmlFor="beat-still-prompt">
+                  Prompt
+                </label>
+                <textarea
+                  id="beat-still-prompt"
+                  className="story-prompt-edit"
+                  value={
+                    inspectKind === "start"
+                      ? composeStartStillPrompt(scene, characters, filmStyle, story)
+                      : composeStillPrompt(scene, characters, filmStyle, story)
+                  }
+                  onChange={(e) =>
+                    patchScene(
+                      selectedScene,
+                      inspectKind === "start"
+                        ? { startPrompt: e.target.value }
+                        : { stillPrompt: e.target.value },
+                    )
+                  }
+                />
+                <ImageModelSelect
+                  id="beat-still-model"
+                  value={scene.imageModel}
+                  onChange={(imageModel) => patchScene(selectedScene, { imageModel })}
+                />
+                <button
+                  type="button"
+                  className="story-tiny"
+                  disabled={stillBusy}
+                  onClick={() => void regenSceneStill(selectedScene, inspectKind)}
+                >
+                  {stillBusy ? "Drawing…" : "Regenerate"}
+                </button>
+                {(inspectKind === "start" ? startErrors[selectedScene] : stillErrors[selectedScene]) ? (
+                  <p className="form-error">
+                    {inspectKind === "start" ? startErrors[selectedScene] : stillErrors[selectedScene]}
+                  </p>
+                ) : null}
+              </>
+            ) : scene ? (
+              <>
+                <p className="story-kicker">
+                  S{selectedScene + 1} of {scenes.length}
+                </p>
+                <label className="story-field" htmlFor="beat-title">
+                  Title
+                </label>
+                <input
+                  id="beat-title"
+                  type="text"
+                  value={scene.title}
+                  onChange={(e) => patchScene(selectedScene, { title: e.target.value })}
+                />
+                <SceneDurationPicker
+                  id="beat-dur"
+                  scene={scene}
+                  onPatch={(partial) => patchScene(selectedScene, partial)}
+                />
+                <label className="story-field" htmlFor="beat-setting">
+                  Setting
+                </label>
+                <textarea
+                  id="beat-setting"
+                  value={scene.setting}
+                  onChange={(e) => patchScene(selectedScene, { setting: e.target.value })}
+                />
+                <label className="story-field" htmlFor="beat-subject">
+                  Subject
+                </label>
+                <textarea
+                  id="beat-subject"
+                  value={scene.subject}
+                  onChange={(e) => patchScene(selectedScene, { subject: e.target.value })}
+                />
+                <label className="story-field" htmlFor="beat-action">
+                  Action
+                </label>
+                <textarea
+                  id="beat-action"
+                  value={scene.action}
+                  onChange={(e) => patchScene(selectedScene, { action: e.target.value })}
+                />
+                <label className="story-field" htmlFor="beat-cam">
+                  Camera
+                </label>
+                <textarea
+                  id="beat-cam"
+                  value={scene.camera_movement}
+                  onChange={(e) => patchScene(selectedScene, { camera_movement: e.target.value })}
+                />
+                <label className="story-field" htmlFor="beat-light">
+                  Lighting
+                </label>
+                <textarea
+                  id="beat-light"
+                  value={scene.lighting}
+                  onChange={(e) => patchScene(selectedScene, { lighting: e.target.value })}
+                />
+                <label className="story-field" htmlFor="beat-style">
+                  Style
+                </label>
+                <input
+                  id="beat-style"
+                  type="text"
+                  value={scene.style}
+                  onChange={(e) => patchScene(selectedScene, { style: e.target.value })}
+                />
+                <DialogueTurnsEditor
+                  turns={dialogueTurnsFromUnknown(scene.dialogue)}
+                  onChange={(turns) => patchScene(selectedScene, { dialogue: serializeDialogueJson(turns) })}
+                />
+                <div className="story-map-tray">
+                  <p className="story-field">CREATE mapping</p>
+                  <p className="story-hint">
+                    This clip sends ≤{FLASH_IMAGE_MAX} images and ≤{FLASH_AUDIO_MAX} audios.
+                    Mapped now: {Math.min(mappedImages.length, FLASH_IMAGE_MAX)} images,{" "}
+                    {Math.min(mappedAudios.length, FLASH_AUDIO_MAX)} audios.
+                  </p>
+                  {imageAssets.map((img) => (
+                    <div className="story-map-row" key={img.key}>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={img.selected && (img.sceneIndex === null || img.sceneIndex === selectedScene)}
+                          onChange={(e) =>
+                            setImageAssets((prev) =>
+                              prev.map((item) =>
+                                item.key === img.key
+                                  ? {
+                                      ...item,
+                                      selected: e.target.checked,
+                                      sceneIndex: e.target.checked ? selectedScene : item.sceneIndex,
+                                    }
+                                  : item,
+                              ),
+                            )
+                          }
+                        />{" "}
+                        {fileStem(img.name) || img.name}
+                      </label>
+                      <select
+                        value={img.sceneIndex === null ? "all" : String(img.sceneIndex)}
+                        onChange={(e) =>
+                          setImageAssets((prev) =>
+                            prev.map((item) =>
+                              item.key === img.key
+                                ? {
+                                    ...item,
+                                    sceneIndex: e.target.value === "all" ? null : Number(e.target.value),
+                                  }
+                                : item,
+                            ),
+                          )
                         }
                       >
-                        Remove
+                        <option value="all">All scenes</option>
+                        {scenes.map((s, i) => (
+                          <option key={s.title + i} value={String(i)}>
+                            S{i + 1}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                  {audioAssets.map((aud) => (
+                    <div className="story-map-row" key={aud.key}>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={aud.selected && (aud.sceneIndex === null || aud.sceneIndex === selectedScene)}
+                          onChange={(e) =>
+                            setAudioAssets((prev) =>
+                              prev.map((item) =>
+                                item.key === aud.key
+                                  ? {
+                                      ...item,
+                                      selected: e.target.checked,
+                                      sceneIndex: e.target.checked ? selectedScene : item.sceneIndex,
+                                    }
+                                  : item,
+                              ),
+                            )
+                          }
+                        />{" "}
+                        {fileStem(aud.name) || aud.name}
+                      </label>
+                      <select
+                        value={aud.sceneIndex === null ? "all" : String(aud.sceneIndex)}
+                        onChange={(e) =>
+                          setAudioAssets((prev) =>
+                            prev.map((item) =>
+                              item.key === aud.key
+                                ? {
+                                    ...item,
+                                    sceneIndex: e.target.value === "all" ? null : Number(e.target.value),
+                                  }
+                                : item,
+                            ),
+                          )
+                        }
+                      >
+                        <option value="all">All scenes</option>
+                        {scenes.map((s, i) => (
+                          <option key={s.title + i} value={String(i)}>
+                            S{i + 1}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <div className="story-insp-actions">
+                  {studioMode === "playback" && clip?.status === "ready" && clip.url ? (
+                    <>
+                      <a className="story-ghost-full" href={clip.url} download target="_blank" rel="noopener noreferrer">
+                        Download
+                      </a>
+                      <button type="button" className="story-ghost-full" onClick={() => regenScene(selectedScene)}>
+                        Regenerate this scene
                       </button>
-                    </p>
-                  ) : (
-                    <p className="hint">Optional. Upload a photo, then regenerate with prompt + model.</p>
-                  )}
-                </div>
-                <div className="row">
-                  <label className="field" htmlFor={`character-prompt-${index}`}>
-                    Generate prompt
-                  </label>
-                  <PromptComposer
-                    id={`character-prompt-${index}`}
-                    className="is-short"
-                    showChips={false}
-                    placeholder="Optional extra instruction. Type @ to mention an image."
-                    value={ch.generatePrompt}
-                    images={mentionMedia.images}
-                    audios={mentionMedia.audios}
-                    onChange={(generatePrompt) => patchCharacter(index, { generatePrompt })}
-                  />
-                </div>
-                <ImageModelSelect
-                  id={`character-model-${index}`}
-                  value={ch.imageModel}
-                  onChange={(imageModel) => patchCharacter(index, { imageModel })}
-                />
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  disabled={sheetBusy || writing}
-                  onClick={() => void regenOneSheet(index)}
-                >
-                  {sheetBusy ? "Drawing…" : "Regenerate this spritesheet"}
-                </button>
-              </div>
-            ))}
-            {assetsBlock("story-board")}
-            <ModelRadios name="story-model-board" model={model} onChange={changeModel} />
-            {filmBlock("story-board")}
-            {modelSnapHint ? <p className="hint">{modelSnapHint}</p> : null}
-            <button
-              type="button"
-              className="btn btn-ghost"
-              disabled={writing}
-              onClick={() => {
-                if (!window.confirm("Replace these scenes? Edits go away. Clips have not started.")) return;
-                void writeStoryboard(true);
-              }}
-            >
-              {writing ? "Writing…" : "Regenerate storyboard"}
-            </button>
-            <p className="hint">Overwrites scene list. Story text is sent again.</p>
-            {writeError ? <p className="form-error">{writeError}</p> : null}
-          </div>
-
-          <aside className="job" aria-labelledby="scenes-heading">
-            <div className="board-meta">
-              <h2 className="block" id="scenes-heading" tabIndex={-1} ref={scenesHeadingRef}>
-                Scenes
-              </h2>
-              <p className="hint">
-                {scenes.length} · {formatStoryLength(totalSec)}
-                {targetMinutes ? ` · target ${targetMinutes} min` : ""}
-              </p>
-              {stillBusy || stillNote ? (
-                <div className="job-run">
-                  {stillBusy ? <span className="spin" aria-hidden="true" /> : null}
-                  <p className="job-line">{stillNote || "Drawing scene stills…"}</p>
-                </div>
-              ) : null}
-              <div className="scene-fold-actions">
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => setOpenScenes(new Set(scenes.map((_, i) => i)))}
-                >
-                  Expand all
-                </button>
-                <button type="button" className="btn btn-ghost" onClick={() => setOpenScenes(new Set())}>
-                  Collapse all
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  disabled={stillBusy || writing || sheetBusy || !scenes.some((s) => s.bridgeUrl || s.bridgeId || s.startUrl || s.startId)}
-                  onClick={() => void checkAndFixStills()}
-                >
-                  Check &amp; fix stills
-                </button>
-              </div>
-            </div>
-            {scenes.map((scene, index) => {
-              const empty = triedLooksGood && !shotReady(scene);
-              const dropDisabled = scenes.length <= STORY_SCENE_MIN;
-              const range = sceneTimeRange(
-                scenes.map((s) => s.duration_sec),
-                index,
-              );
-              const patch = (partial: Partial<SceneDraft>) => {
-                setScenes((prev) => prev.map((s, i) => (i === index ? { ...s, ...partial } : s)));
-              };
-              return (
-                <div key={`scene-${index}`} className={`scene-slot${empty ? " is-incomplete" : ""}`}>
-                  {index === 0 ? (
-                    <p className="handoff">
-                      {characters.every((c) => c.stillUrl)
-                        ? sceneUsesSheetI2V(scenes, index)
-                          ? "Scene 1 is image-to-video from the cast spritesheets. No generated start or end still."
-                          : "Scene 1 starts from the cast spritesheets and ends on a generated still."
-                        : "Spritesheets still drawing. Wait or regenerate the missing one."}
-                    </p>
-                  ) : (
-                    <p className="handoff">
-                      {sceneUsesSheetI2V(scenes, index)
-                        ? "New character in this beat — image-to-video from their sheet. No generated stills."
-                        : sceneNeedsGeneratedStart(scenes, index)
-                          ? `Previous clip was image-to-video. Scene ${index + 1} gets its own opening still.`
-                          : `End of scene ${index} is the start of scene ${index + 1} — same picture, not drawn twice.`}
-                    </p>
-                  )}
-                  <SceneBeatPair
-                    index={index}
-                    scene={scene}
-                    scenes={scenes}
-                    characters={characters}
-                    filmStyle={filmStyle}
-                    story={story}
-                    stillBusy={stillBusy}
-                    endError={stillErrors[index]}
-                    startError={startErrors[index]}
-                    onZoom={openZoom}
-                    onRegenEnd={(i) => void regenSceneStill(i, "end")}
-                    onRegenStart={(i) => void regenSceneStill(i, "start")}
-                    onStillPrompt={(i, value) => patchScene(i, { stillPrompt: value })}
-                    onStartPrompt={(i, value) => patchScene(i, { startPrompt: value })}
-                    mentionImages={mentionMedia.images}
-                    mentionAudios={mentionMedia.audios}
-                  />
-                  <details
-                    className="scene-fold"
-                    open={openScenes.has(index)}
-                    onToggle={(e) => {
-                      const isOpen = e.currentTarget.open;
-                      setOpenScenes((prev) => {
-                        const next = new Set(prev);
-                        if (isOpen) next.add(index);
-                        else next.delete(index);
-                        return next;
-                      });
-                    }}
-                  >
-                    <summary className="scene-summary">
-                      <span className="scene-chevron" aria-hidden="true">
-                        {openScenes.has(index) ? "▾" : "▸"}
-                      </span>
-                      <span className="scene-index">{index + 1}</span>
-                      <span className="scene-summary-title">{scene.title.trim() || `Scene ${index + 1}`}</span>
-                      <span className="hint">
-                        {scene.duration_sec}s · {range.start}–{range.end}
-                        {scene.cast.length > 0 ? ` · ${scene.cast.join(", ")}` : ""}
-                      </span>
-                      {empty ? (
-                        <span className="field-error">Needs Scene / Subject / Action</span>
-                      ) : null}
-                    </summary>
-                    <div className="scene-body">
-                    <div className="scene-head">
-                      <label className="field" htmlFor={`scene-title-${index}`}>
-                        Title
-                      </label>
-                      <input
-                        id={`scene-title-${index}`}
-                        className="scene-title"
-                        type="text"
-                        aria-label={`Scene ${index + 1} title`}
-                        value={scene.title}
-                        onChange={(e) => {
-                          const title = e.target.value;
-                          setScenes((prev) => prev.map((s, i) => (i === index ? { ...s, title } : s)));
-                        }}
-                      />
-                    </div>
-                    <p className="hint">
-                      Duration: {range.start}–{range.end} sec
-                      {scene.cast.length > 0 ? ` · cast ${scene.cast.join(", ")}` : ""}
-                    </p>
-                    <SceneDurationPicker
-                      index={index}
-                      scene={scene}
-                      model={model}
-                      durationOptions={durationOptions}
-                      v20Resolution={v20Resolution}
-                      fps={fps}
-                      planMaxSec={planMaxSec}
-                      namePrefix="scene"
-                      onPatch={patch}
-                    />
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-setting-${index}`}>
-                        Scene{" "}
-                        <abbr className="req" title="required">
-                          *
-                        </abbr>
-                      </label>
-                      <textarea
-                        id={`scene-setting-${index}`}
-                        rows={2}
-                        value={scene.setting}
-                        aria-invalid={empty && !scene.setting.trim() ? true : undefined}
-                        onChange={(e) => patch({ setting: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-subject-${index}`}>
-                        Subject{" "}
-                        <abbr className="req" title="required">
-                          *
-                        </abbr>
-                      </label>
-                      <textarea
-                        id={`scene-subject-${index}`}
-                        rows={2}
-                        value={scene.subject}
-                        aria-invalid={empty && !scene.subject.trim() ? true : undefined}
-                        onChange={(e) => patch({ subject: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-action-${index}`}>
-                        Action{" "}
-                        <abbr className="req" title="required">
-                          *
-                        </abbr>
-                      </label>
-                      <textarea
-                        id={`scene-action-${index}`}
-                        rows={2}
-                        value={scene.action}
-                        aria-invalid={empty && !scene.action.trim() ? true : undefined}
-                        onChange={(e) => patch({ action: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-cam-${index}`}>
-                        Camera_Movement
-                      </label>
-                      <textarea
-                        id={`scene-cam-${index}`}
-                        rows={2}
-                        value={scene.camera_movement}
-                        onChange={(e) => patch({ camera_movement: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-light-${index}`}>
-                        Lighting
-                      </label>
-                      <textarea
-                        id={`scene-light-${index}`}
-                        rows={2}
-                        value={scene.lighting}
-                        onChange={(e) => patch({ lighting: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-style-${index}`}>
-                        Style
-                      </label>
-                      <input
-                        id={`scene-style-${index}`}
-                        type="text"
-                        value={scene.style}
-                        onChange={(e) => patch({ style: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-dialogue-${index}`}>
-                        Dialogue
-                      </label>
-                      <textarea
-                        id={`scene-dialogue-${index}`}
-                        rows={2}
-                        value={scene.dialogue}
-                        onChange={(e) => patch({ dialogue: e.target.value })}
-                      />
-                    </div>
-                    <div className="row">
-                      <label className="field" htmlFor={`scene-video-prompt-${index}`}>
-                        Prompt
-                      </label>
-                      <PromptComposer
-                        id={`scene-video-prompt-${index}`}
-                        className="is-clip"
-                        showChips={false}
-                        placeholder="Built from this scene. Type @ to mention Image1. Edit to override."
-                        value={composeSceneVideoPrompt(index, scenes, characters)}
-                        images={mentionMedia.images}
-                        audios={mentionMedia.audios}
-                        onChange={(videoPrompt) => patch({ videoPrompt })}
-                      />
-                    </div>
+                    </>
+                  ) : null}
+                  {studioMode === "playback" && clip?.status === "failed" ? (
                     <button
                       type="button"
-                      className="btn"
-                      disabled={dropDisabled}
-                      onClick={() => dropScene(index)}
+                      className="story-ghost-full story-danger"
+                      onClick={() => resumeFrom(selectedScene)}
                     >
-                      Drop
+                      Retry this scene
                     </button>
-                    {dropDisabled ? <p className="hint">Need at least two scenes.</p> : null}
-                    </div>
-                  </details>
-                </div>
-              );
-            })}
-            <div className="generate-bar">
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={
-                  writing ||
-                  sheetBusy ||
-                  assetStoring ||
-                  stillBusy ||
-                  characters.length === 0 ||
-                  characters.some((c) => !c.stillUrl) ||
-                  scenes.some((s) => !shotReady(s))
-                }
-                onClick={looksGood}
-              >
-                Looks good — generate clips
-              </button>
-              <button
-                type="button"
-                className="btn dock-secondary"
-                disabled={stillBusy || writing || sheetBusy || !scenes.some((s) => s.bridgeUrl || s.bridgeId || s.startUrl || s.startId)}
-                onClick={() => void checkAndFixStills()}
-              >
-                Check &amp; fix stills
-              </button>
-              <p className="hint">
-                Scene 1 (and any later beat that introduces a new character) is image-to-video from
-                character sheets — no generated start/end stills. Other later scenes: landing still of N →
-                start of N+1. Next create ~65s after the previous POST even if that clip is still generating.
-                Same seed. Max beat {planMaxSec}s. Total about {formatStoryLength(totalSec)}. Check &amp; fix
-                judges each landing still — spritesheet or clone fails get redrawn (free images).
-              </p>
-            </div>
-          </aside>
-        </div>
-      ) : null}
-
-      {gate === "clips" ? (
-        <>
-          <div className="story-queue job-well" aria-live="polite" aria-atomic="true">
-            {generatingIndex >= 0 || merging || stillBusy ? (
-              <div className="job-run">
-                <span className="spin" aria-hidden="true" />
-                <p className="job-line sr-status">{queueLive()}</p>
-              </div>
-            ) : (
-              <p className="sr-status">{queueLive()}</p>
-            )}
-            {queueRunning ? (
-              <div className="story-queue-actions">
-                <button type="button" className="btn" onClick={() => stopQueue(true)}>
-                  Abort
-                </button>
-              </div>
-            ) : null}
-            {failedIndex >= 0 && generatingIndex < 0 && !merging && !mergedUrl && !stillBusy ? (
-              <div className="story-queue-actions">
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={() => resumeFrom(failedIndex)}
-                >
-                  Resume from scene {failedIndex + 1}
-                </button>
-              </div>
-            ) : null}
-            <div className="story-queue-actions">
-              <button
-                type="button"
-                className="btn"
-                disabled={stillBusy || merging || !scenes.some((s) => s.bridgeUrl || s.bridgeId || s.startUrl || s.startId)}
-                onClick={() => void checkAndFixStills()}
-              >
-                Check &amp; fix stills
-              </button>
-            </div>
-            {!mergedUrl ? (
-              <p className="hint">
-                Free accounts: about one create every 65s. Earlier clips can keep generating.
-                {queueNote ? ` ${queueNote}` : ""} Check &amp; fix judges start/end stills (spritesheet / clones)
-                and redraws fails.
-              </p>
-            ) : null}
-          </div>
-
-          <div className="story-clips">
-            {clips.map((clip, index) => {
-              const scene = scenes[index];
-              const busyRow = clip.status === "generating";
-              return (
-                <div key={`clip-${index}`}>
-                  {index > 0 ? (
-                    <p className="handoff">
-                      {sceneUsesSheetI2V(scenes, index)
-                        ? "New character in this beat — image-to-video from their sheet. No generated stills."
-                        : sceneNeedsGeneratedStart(scenes, index)
-                          ? `Previous clip was image-to-video. Scene ${index + 1} gets its own opening still.`
-                          : `End of ${index} is the start of ${index + 1} — same picture.`}
-                    </p>
-                  ) : (
-                    <p className="handoff">
-                      {characters.some((c) => c.stillUrl)
-                        ? "Scene 1 is image-to-video from the cast spritesheets. No generated start or end still."
-                        : "Scene 1 needs character spritesheets."}
-                    </p>
-                  )}
-                  {scene ? (
-                    <SceneBeatPair
-                      index={index}
-                      scene={scene}
-                      scenes={scenes}
-                      characters={characters}
-                      filmStyle={filmStyle}
-                      story={story}
-                      stillBusy={stillBusy}
-                      endError={stillErrors[index]}
-                      startError={startErrors[index]}
-                      onZoom={openZoom}
-                      onRegenEnd={(i) => void regenSceneStill(i, "end")}
-                      onRegenStart={(i) => void regenSceneStill(i, "start")}
-                      onStillPrompt={(i, value) => patchScene(i, { stillPrompt: value })}
-                      onStartPrompt={(i, value) => patchScene(i, { startPrompt: value })}
-                      mentionImages={mentionMedia.images}
-                      mentionAudios={mentionMedia.audios}
-                    />
                   ) : null}
-                  <div className="clip-row">
-                    <div className="clip-head">
-                      <p>
-                        <strong>
-                          {index + 1} {scene?.title ?? ""} · {scene?.duration_sec ?? 0}s
-                        </strong>
-                      </p>
-                      <p className="block clip-status">
-                        {statusLabel(clip.status)}
-                        {clip.status === "generating" && typeof clip.progress === "number"
-                          ? `  ${clip.progress}%`
-                          : ""}
-                      </p>
-                    </div>
-                    <div className="clip-body">
-                      <div>
-                        {clip.status === "ready" && clip.url ? (
-                          <video className="player" src={clip.url} controls playsInline />
-                        ) : clip.status === "generating" ? (
-                          <div className="job-well">
-                            <div className="job-run">
-                              <span className="spin" aria-hidden="true" />
-                              <p>In progress</p>
-                            </div>
-                          </div>
-                        ) : clip.status === "failed" ? (
-                          <p className="form-error">{clip.error ?? "Generation failed."}</p>
-                        ) : clip.status === "queued" ? (
-                          <div className="job-well">
-                            <p>Next create after the free-tier gap.</p>
-                          </div>
-                        ) : (
-                          <div className="job-well">
-                            <p>
-                              {index === 0
-                                ? "Waiting to start."
-                                : `Waits for scene ${index}. Then ~1 min free-tier gap before create.`}
-                            </p>
-                          </div>
-                        )}
-                        {clip.videoId ? <p className="mono">video_id: {clip.videoId}</p> : null}
-                        {scene ? (
-                          <div className="row clip-prompt">
-                            <SceneDurationPicker
-                              index={index}
-                              scene={scene}
-                              model={model}
-                              durationOptions={durationOptions}
-                              v20Resolution={v20Resolution}
-                              fps={fps}
-                              planMaxSec={planMaxSec}
-                              namePrefix="clip"
-                              onPatch={(partial) => patchScene(index, partial)}
-                            />
-                            <label className="field" htmlFor={`clip-video-prompt-${index}`}>
-                              Prompt
-                            </label>
-                            <PromptComposer
-                              id={`clip-video-prompt-${index}`}
-                              className="is-clip"
-                              showChips={false}
-                              placeholder="This is the clip prompt. Type @ to mention Image1."
-                              value={composeSceneVideoPrompt(index, scenes, characters)}
-                              images={mentionMedia.images}
-                              audios={mentionMedia.audios}
-                              onChange={(videoPrompt) => patchScene(index, { videoPrompt })}
-                            />
-                            <p className="hint">
-                              This is the prompt that will be sent. Edit it before regenerate. Duration
-                              follows {model === MODEL_FLASH ? "Flash" : `${v20Resolution} · ${fps} fps`}{" "}
-                              (max {planMaxSec}s). Only this clip is remade. Later clips stay.
-                            </p>
-                          </div>
-                        ) : null}
-                        <div className="clip-actions">
-                          {clip.status === "ready" && clip.url ? (
-                            <>
-                              <a className="btn" href={clip.url} download target="_blank" rel="noopener noreferrer">
-                                Download
-                              </a>
-                              <button
-                                type="button"
-                                className="btn"
-                                disabled={merging || busyRow}
-                                onClick={() => regenScene(index)}
-                              >
-                                Regenerate this scene
-                              </button>
-                            </>
-                          ) : null}
-                          {clip.status === "failed" ? (
-                            <button
-                              type="button"
-                              className="btn"
-                              disabled={generatingIndex >= 0 || merging}
-                              onClick={() => resumeFrom(index)}
-                            >
-                              Retry this scene
-                            </button>
-                          ) : null}
-                        </div>
-                      </div>
-                      <div className="clip-side">
-                        {clip.status === "ready" && clip.lastFrameSrc ? (
-                          <>
-                            <p className="hint">Decoded last frame</p>
-                            <ZoomableImage src={clip.lastFrameSrc} alt={`Scene ${index + 1} decoded last frame`} onZoom={openZoom} />
-                          </>
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
+                  <button
+                    type="button"
+                    className="story-ghost-full story-danger"
+                    disabled={scenes.length <= STORY_SCENE_MIN}
+                    onClick={() => dropScene(selectedScene)}
+                  >
+                    Drop scene
+                  </button>
                 </div>
-              );
-            })}
-
-            {mergedUrl ? (
-              <div className="merge-result">
-                <video
-                  ref={mergedPlayerRef}
-                  className="player"
-                  src={mergedUrl}
-                  controls
-                  playsInline
-                  tabIndex={-1}
-                />
-                <p>
-                  <a href={mergedUrl} download target="_blank" rel="noopener noreferrer">
-                    Download MP4
-                  </a>
-                </p>
-              </div>
-            ) : (
-              <div className="merge-bar">
-                {allReady ? (
-                  <ClipTimeline
-                    scenes={scenes}
-                    clips={clips}
-                    order={clipOrder}
-                    onReorder={setMergeOrder}
-                    disabled={merging}
-                  />
-                ) : null}
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={mergeChecked}
-                    disabled={!allReady || merging}
-                    onChange={(e) => setMergeChecked(e.target.checked)}
-                  />
-                  <span>These clips are correct</span>
-                </label>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  disabled={!allReady || !mergeChecked || merging}
-                  onClick={() => void mergeClips()}
-                >
-                  {merging ? "Merging…" : "Merge clips"}
-                </button>
-                <p className="hint">No speech, no captions. Concat only. Download is on the merged file.</p>
-                {mergeError ? <p className="form-error">{mergeError}</p> : null}
-              </div>
-            )}
+              </>
+            ) : null}
           </div>
-        </>
+        </aside>
+      </div>
+
+      <footer className="story-dock story-glass" aria-label="Timeline">
+        <div className="story-dock-h">
+          <span>
+            {bridgeNote
+              ? bridgeNote
+              : studioMode === "compose"
+                ? "No scenes yet"
+                : studioMode === "board"
+                  ? stillBusy
+                    ? stillNote || "Drawing stills…"
+                    : `${scenes.length} scenes`
+                  : queueNote || queueLive()}
+          </span>
+          <button
+            ref={addBtnRef}
+            type="button"
+            className="story-tiny story-add-beat is-scene"
+            onClick={() => setAddModal("scene")}
+          >
+            + Add scene
+          </button>
+          <button
+            type="button"
+            className="story-tiny story-add-beat is-clip"
+            ref={addClipBtnRef}
+            disabled={!allReady}
+            title={!allReady ? "Add clip when all clips are ready" : "Add clip"}
+            onClick={() => {
+              if (!allReady) return;
+              setAddModal("clip");
+            }}
+          >
+            + Add clip
+          </button>
+          {studioMode === "playback" && !allReady ? (
+            <span className="story-clip-hint">Add clip when all clips are ready</span>
+          ) : null}
+        </div>
+        <div className="story-empty-dock">Write a topic to add scenes</div>
+        <div className="story-track" role="listbox" aria-label="Scene cards">
+          {scenes.map((s, index) => {
+            const clipSt = clips[index]?.status;
+            const drawingThis = drawingScenes.includes(index);
+            const st = clipSt ?? (drawingThis ? "generating" : "waiting");
+            const showStatus = Boolean(clipSt) || drawingThis;
+            const firstRef = (s.i2vRefs ?? [])[0];
+            const thumb =
+              (firstRef ? mediaPreview(firstRef.id, firstRef.url) : "") ||
+              mediaPreview(s.startId, s.startUrl) ||
+              mediaPreview(s.bridgeId, s.bridgeUrl) ||
+              (characters[0] ? mediaPreview(characters[0].stillId, characters[0].stillUrl) : "");
+            const i2v = sceneIsI2V(scenes, index);
+            return (
+              <button
+                key={`card-${index}`}
+                type="button"
+                role="option"
+                draggable={false}
+                aria-selected={selectedScene === index}
+                className={`story-scene${selectedScene === index ? " is-on" : ""}${st === "generating" && showStatus ? " is-gen" : ""}${!s.setting.trim() ? " is-blank" : ""}`}
+                data-drawing={drawingThis ? "true" : undefined}
+                onClick={() => {
+                  setSelectedScene(index);
+                  setBeatFocus("scene");
+                  setInspectKind(null);
+                  if (isPhoneStory()) setMobilePane("details");
+                }}
+              >
+                {thumb ? <StoryCachedImg className="pic" src={thumb} alt="" /> : <span className="pic" />}
+                <span className="meta">
+                  <span className="ttl">{s.title.trim() || `Scene ${index + 1}`}</span>
+                  <span className="dur">{s.duration_sec}s</span>
+                </span>
+                <span className="st">
+                  <span className="story-shot-tag">{i2v ? "I2V" : "Keyframe"}</span>
+                  {showStatus ? (clipSt ? statusLabel(clipSt) : "DRAWING") : null}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {studioMode === "playback" && allReady && !mergedUrl ? (
+          <ClipTimeline
+            scenes={scenes}
+            clips={clips}
+            order={clipOrder}
+            onReorder={setMergeOrder}
+            disabled={merging || !allReady}
+          />
+        ) : null}
+        {mergeError ? <p className="form-error">{mergeError}</p> : null}
+        {queueRunning ? null : failedIndex >= 0 && generatingIndex < 0 && !merging && !mergedUrl ? (
+          <p className="story-hint">
+            <button type="button" className="story-tiny" onClick={() => resumeFrom(failedIndex)}>
+              Resume from scene {failedIndex + 1}
+            </button>
+          </p>
+        ) : null}
+      </footer>
+
+      {addModal ? (
+        <AddSceneModal
+          kind={addModal}
+          scenes={scenes}
+          ratio={flashAspect}
+          onClose={() => {
+            const kind = addModal;
+            setAddModal(null);
+            queueMicrotask(() => (kind === "clip" ? addClipBtnRef : addBtnRef).current?.focus());
+          }}
+          onAdd={(form) => {
+            const generate = addModal === "clip";
+            const kind = addModal;
+            setAddModal(null);
+            insertBeat(form, generate);
+            queueMicrotask(() => (kind === "clip" ? addClipBtnRef : addBtnRef).current?.focus());
+          }}
+        />
       ) : null}
       {zoom ? <ZoomLightbox src={zoom.src} alt={zoom.alt} onClose={closeZoom} /> : null}
     </div>
   );
 });
+

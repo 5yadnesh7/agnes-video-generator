@@ -4,6 +4,18 @@ export function isAgnesStatusQueryLimit(detail: string): boolean {
   return lower.includes("too many video status") || lower.includes("too many status quer");
 }
 
+/** CREATE reject: Agnes video queue is full / try again after 1 minute. Matches raw and humanized copy. */
+export function isAgnesCreateQueueFull(detail: string): boolean {
+  const lower = detail.toLowerCase();
+  return (
+    lower.includes("queue is full") ||
+    (lower.includes("video queue") && lower.includes("retry")) ||
+    lower.includes("try again after 1 minute") ||
+    lower.includes("retry later") ||
+    lower.includes("try again later")
+  );
+}
+
 export function humanizeAgnesDetail(detail: string): string {
   const text = detail.trim();
   const lower = text.toLowerCase();
@@ -13,11 +25,15 @@ export function humanizeAgnesDetail(detail: string): string {
   if (isAgnesStatusQueryLimit(text)) {
     return "Too many status checks. Next check in 1 minute.";
   }
-  if (lower.includes("queue is full") || (lower.includes("video queue") && lower.includes("retry"))) {
+  if (isAgnesCreateQueueFull(text)) {
+    if (
+      lower.includes("retry later") ||
+      lower.includes("try again later") ||
+      lower.includes("agnes is busy")
+    ) {
+      return "Agnes is busy. Try again after 1 minute.";
+    }
     return "Video queue is full. Try again after 1 minute.";
-  }
-  if (lower.includes("retry later") || lower.includes("try again later")) {
-    return "Agnes is busy. Try again after 1 minute.";
   }
   return text;
 }

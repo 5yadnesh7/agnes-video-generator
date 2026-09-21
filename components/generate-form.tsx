@@ -1356,7 +1356,7 @@ export function GenerateForm() {
     job.phase === "posting" ? "Starting…" : job.phase === "generating" ? "Generating…" : "Generate video";
 
   return (
-    <div className="app">
+    <div className={`app${benchMode === "story" ? " is-story" : ""}`}>
       <header className="shell">
         <p className="brand">Agnes Video</p>
         <fieldset className="seg" style={{ border: 0, margin: 0 }}>

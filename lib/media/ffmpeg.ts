@@ -7,7 +7,14 @@ import path from "node:path";
 
 import ffmpegStatic from "ffmpeg-static";
 
+import { parseFfmpegVideoProbe, type VideoProbe } from "@/lib/media/concat-filter";
+
+export { concatFilterArgs, parseFfmpegVideoProbe } from "@/lib/media/concat-filter";
+export type { ConcatScale, VideoProbe } from "@/lib/media/concat-filter";
+
 export const FFMPEG_MISSING = "FFmpeg is not available on this server.";
+
+const STDERR_CAP = 16_384;
 
 let resolvedBin: string | null | undefined;
 
@@ -45,25 +52,43 @@ export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T
   }
 }
 
-export async function runFfmpeg(
-  args: string[],
-): Promise<{ ok: true } | { ok: false; missing: boolean }> {
+async function spawnFfmpeg(args: string[]): Promise<{ missing: boolean; code: number | null; stderr: string }> {
   const bin = await ffmpegBin();
-  if (!bin) return { ok: false, missing: true };
+  if (!bin) return { missing: true, code: null, stderr: "" };
   return new Promise((resolve) => {
-    const child = spawn(bin, args, { windowsHide: true, stdio: "ignore" });
+    const child = spawn(bin, args, { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length >= STDERR_CAP) return;
+      stderr += chunk.toString("utf8").slice(0, STDERR_CAP - stderr.length);
+    });
     child.on("error", (err) => {
       const code = (err as NodeJS.ErrnoException).code;
-      resolve({ ok: false, missing: code === "ENOENT" });
+      resolve({ missing: code === "ENOENT", code: null, stderr });
     });
     child.on("close", (code) => {
-      if (code === 0) {
-        resolve({ ok: true });
-        return;
-      }
-      resolve({ ok: false, missing: false });
+      resolve({ missing: false, code, stderr });
     });
   });
+}
+
+export async function runFfmpeg(
+  args: string[],
+): Promise<{ ok: true } | { ok: false; missing: boolean; stderr: string }> {
+  const result = await spawnFfmpeg(args);
+  if (result.missing) return { ok: false, missing: true, stderr: result.stderr };
+  if (result.code === 0) return { ok: true };
+  return { ok: false, missing: false, stderr: result.stderr };
+}
+
+export async function probeVideo(
+  inputPath: string,
+): Promise<{ ok: true } & VideoProbe | { ok: false; missing: boolean; stderr: string }> {
+  const result = await spawnFfmpeg(["-hide_banner", "-i", inputPath]);
+  if (result.missing) return { ok: false, missing: true, stderr: result.stderr };
+  const parsed = parseFfmpegVideoProbe(result.stderr);
+  if (!parsed) return { ok: false, missing: false, stderr: result.stderr };
+  return { ok: true, ...parsed };
 }
 
 export function extractLastFrameArgs(inputPath: string, outputPath: string): string[] {
@@ -72,31 +97,6 @@ export function extractLastFrameArgs(inputPath: string, outputPath: string): str
 
 export function concatCopyArgs(listPath: string, outputPath: string): string[] {
   return ["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", outputPath];
-}
-
-export function concatReencodeArgs(listPath: string, outputPath: string): string[] {
-  return [
-    "-y",
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    listPath,
-    "-s",
-    "1280x720",
-    "-r",
-    "24",
-    "-c:v",
-    "libx264",
-    "-pix_fmt",
-    "yuv420p",
-    "-c:a",
-    "aac",
-    "-movflags",
-    "+faststart",
-    outputPath,
-  ];
 }
 
 export function concatListBody(filePaths: string[]): string {

@@ -82,8 +82,15 @@ export const V20_REFERENCE_HINT =
 export const FLASH_SECONDS_MIN = 4;
 export const FLASH_SECONDS_MAX = 12;
 export const FLASH_DEFAULT_SECONDS = "5";
-/** Storyboard Flash clips are always the model hard max. */
+/** Story Flash default clip length; user may set any integer in 4–12. */
 export const FLASH_STORY_SECONDS = FLASH_SECONDS_MAX;
+export const FLASH_STORY_DURATION_OPTIONS = [4, 5, 6, 7, 8, 9, 10, 11, 12] as const;
+
+/** Compose uploads before Write. Board library includes generated image aliases. */
+export const STORY_COMPOSE_IMAGE_MAX = 20;
+export const STORY_COMPOSE_AUDIO_MAX = 10;
+export const STORY_BOARD_IMAGE_MAX = 50;
+export const STORY_BOARD_AUDIO_MAX = 30;
 export const FLASH_SIZE = "720P" as const;
 /** Agnes Flash reference: images length must not exceed 5. */
 export const FLASH_IMAGE_MAX = 5;
@@ -237,7 +244,9 @@ export function snapStoryDuration(
   maxFrames: number = V20_MAX_FRAMES["720p"],
 ): number {
   if (model === MODEL_FLASH) {
-    return FLASH_STORY_SECONDS;
+    const n = Math.round(Number(durationSec));
+    if (!Number.isFinite(n)) return FLASH_STORY_SECONDS;
+    return Math.min(FLASH_SECONDS_MAX, Math.max(FLASH_SECONDS_MIN, n));
   }
   return nearestV20Duration(durationSec, fps, maxFrames);
 }
@@ -248,7 +257,11 @@ export function storyTiming(
   maxFrames: number = V20_MAX_FRAMES["720p"],
 ): { min: number; max: number; options: number[] } {
   if (model === MODEL_FLASH) {
-    return { min: FLASH_STORY_SECONDS, max: FLASH_STORY_SECONDS, options: [FLASH_STORY_SECONDS] };
+    return {
+      min: FLASH_SECONDS_MIN,
+      max: FLASH_SECONDS_MAX,
+      options: [...FLASH_STORY_DURATION_OPTIONS],
+    };
   }
   const options = allowedV20Durations(fps, maxFrames);
   return {

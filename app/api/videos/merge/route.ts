@@ -2,7 +2,16 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { STORY_SCENE_HARD_MAX, STORY_SCENE_MIN } from "@/lib/agnes/constants";
-import { concatCopyArgs, concatListBody, concatReencodeArgs, FFMPEG_MISSING, runFfmpeg, withTempDir } from "@/lib/media/ffmpeg";
+import {
+  concatCopyArgs,
+  concatFilterArgs,
+  concatListBody,
+  FFMPEG_MISSING,
+  probeVideo,
+  runFfmpeg,
+  withTempDir,
+  type VideoProbe,
+} from "@/lib/media/ffmpeg";
 import { assertSafeHttpsUrl, downloadHttpsToFile } from "@/lib/media/safe-download";
 import { saveUpload } from "@/lib/media/store";
 
@@ -17,6 +26,11 @@ function isRecord(value: unknown): boolean {
 
 function jsonError(status: number, detail: string): Response {
   return Response.json({ detail }, { status });
+}
+
+function ffmpegTail(stderr: string): string {
+  const t = stderr.trim();
+  return t.length <= 2000 ? t : t.slice(-2000);
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -69,14 +83,39 @@ export async function POST(request: Request): Promise<Response> {
       await writeFile(listPath, concatListBody(clipPaths), "utf8");
       const outputPath = path.join(dir, "merged.mp4");
 
+      // Concat the submitted source clips once. Never concat a previous merged file + a new clip.
       const copied = await runFfmpeg(concatCopyArgs(listPath, outputPath));
       if (!copied.ok && copied.missing) {
         return jsonError(502, FFMPEG_MISSING);
       }
       if (!copied.ok) {
-        const reencoded = await runFfmpeg(concatReencodeArgs(listPath, outputPath));
+        console.info("ffmpeg concat copy failed: %s", ffmpegTail(copied.stderr));
+        const probes: VideoProbe[] = [];
+        for (const clipPath of clipPaths) {
+          const probed = await probeVideo(clipPath);
+          if (!probed.ok) {
+            if (probed.missing) return jsonError(502, FFMPEG_MISSING);
+            console.info("ffmpeg probe failed: %s", ffmpegTail(probed.stderr));
+            return jsonError(502, "Could not merge these clips.");
+          }
+          probes.push(probed);
+        }
+        const first = probes[0];
+        if (!first) return jsonError(502, "Could not merge these clips.");
+        const mismatch = probes.some((p) => p.width !== first.width || p.height !== first.height);
+        const reencoded = await runFfmpeg(
+          concatFilterArgs({
+            inputs: clipPaths,
+            outputPath,
+            width: first.width,
+            height: first.height,
+            fps: first.fps,
+            scale: mismatch ? "pad" : "none",
+          }),
+        );
         if (!reencoded.ok) {
           if (reencoded.missing) return jsonError(502, FFMPEG_MISSING);
+          console.info("ffmpeg concat reencode failed: %s", ffmpegTail(reencoded.stderr));
           return jsonError(502, "Could not merge these clips.");
         }
       }

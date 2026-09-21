@@ -52,7 +52,15 @@ function tokenFor(kind: ChipKind, index: number): string {
   return kind === "picture" ? `<Picture ${index}>` : `<Audio ${index}>`;
 }
 
-function displayName(kind: ChipKind, index: number): string {
+function displayName(
+  kind: ChipKind,
+  index: number,
+  images: PromptChipItem[] = [],
+  audios: PromptChipItem[] = [],
+): string {
+  const list = kind === "picture" ? images : audios;
+  const named = list[index - 1]?.label?.trim();
+  if (named) return named;
   return kind === "picture" ? `Image${index}` : `Audio${index}`;
 }
 
@@ -83,7 +91,7 @@ function createChipEl(spec: ChipSpec, images: PromptChipItem[], audios: PromptCh
   }
   const name = document.createElement("span");
   name.className = "prompt-inline-name";
-  name.textContent = displayName(spec.kind, spec.index);
+  name.textContent = displayName(spec.kind, spec.index, images, audios);
   chip.appendChild(name);
   return chip;
 }
@@ -227,11 +235,16 @@ function readyMentions(images: PromptChipItem[], audios: PromptChipItem[]): Chip
   return out;
 }
 
-function filterMentions(items: ChipSpec[], query: string): ChipSpec[] {
+function filterMentions(
+  items: ChipSpec[],
+  query: string,
+  images: PromptChipItem[],
+  audios: PromptChipItem[],
+): ChipSpec[] {
   const q = query.trim().toLowerCase();
   if (!q) return items;
   return items.filter((spec) => {
-    const name = displayName(spec.kind, spec.index).toLowerCase();
+    const name = displayName(spec.kind, spec.index, images, audios).toLowerCase();
     return name.includes(q) || String(spec.index) === q;
   });
 }
@@ -395,6 +408,8 @@ export function PromptComposer({
       const url = lookupUrl({ ...parsed, url: "" }, images, audios);
       const img = chip.querySelector("img");
       if (parsed.kind === "picture" && url && img) img.src = url;
+      const nameEl = chip.querySelector(".prompt-inline-name");
+      if (nameEl) nameEl.textContent = displayName(parsed.kind, parsed.index, images, audios);
     });
   }, [images, audios]);
 
@@ -412,7 +427,9 @@ export function PromptComposer({
     return () => document.removeEventListener("mousedown", onDoc);
   }, [menu]);
 
-  const filtered = menu ? filterMentions(readyMentions(images, audios), menu.query) : [];
+  const filtered = menu
+    ? filterMentions(readyMentions(images, audios), menu.query, images, audios)
+    : [];
   const editorClass = ["prompt-composer", className].filter(Boolean).join(" ");
 
   return (
@@ -443,7 +460,7 @@ export function PromptComposer({
         aria-describedby={describedBy}
         aria-autocomplete="list"
         aria-expanded={menu ? true : undefined}
-        data-placeholder={placeholder ?? "Type @ to mention Image1 / Audio1"}
+        data-placeholder={placeholder ?? "Type @ to mention an image or audio by name"}
         onInput={() => {
           const root = editorRef.current;
           if (!root) return;
@@ -462,6 +479,8 @@ export function PromptComposer({
             const choices = filterMentions(
               readyMentions(mediaRef.current.images, mediaRef.current.audios),
               open.query,
+              mediaRef.current.images,
+              mediaRef.current.audios,
             );
             if (e.key === "ArrowDown") {
               e.preventDefault();
@@ -527,7 +546,7 @@ export function PromptComposer({
           ) : (
             filtered.map((spec, i) => {
               const active = i === menu.active;
-              const name = displayName(spec.kind, spec.index);
+              const name = displayName(spec.kind, spec.index, images, audios);
               return (
                 <button
                   key={`${spec.kind}-${spec.index}`}
@@ -605,7 +624,7 @@ function PickerChip({
   onInsert: (spec: ChipSpec) => void;
 }) {
   const ready = !item.storing && !item.error && Boolean(item.url);
-  const short = displayName(kind, index);
+  const short = item.label.trim() || (kind === "picture" ? `Image${index}` : `Audio${index}`);
   const status = item.storing ? "Storing" : item.error ? "Failed" : ready ? "Ready" : "Empty";
   return (
     <button

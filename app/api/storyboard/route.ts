@@ -4,41 +4,32 @@ import {
 } from "@/lib/agnes/api-key";
 import {
   DEFAULT_FRAME_RATE,
-  DEFAULT_V20_RESOLUTION,
+  FLASH_STORY_SECONDS,
   MODEL_FLASH,
   MODEL_V20,
   STORY_CHARACTER_MAX,
   STORY_MAX_TOTAL_SEC,
   STORY_SCENE_HARD_MAX,
   STORY_SCENE_MIN,
-  V20_ASPECTS,
-  V20_FPS_OPTIONS,
-  V20_RESOLUTIONS,
+  V20_MAX_FRAMES,
   clampStoryMinutes,
-  maxFramesForPixels,
   snapStoryDuration,
   storySceneRange,
-  v20Size,
-  type V20Fps,
-  type V20Resolution,
 } from "@/lib/agnes/constants";
 import {
   parseStoryboardContent,
   storyboardMessages,
-  storyboardContinueMessages,
   defaultSpritesheetPrompt,
   asNonEmpty,
 } from "@/lib/agnes/storyboard";
-import { isModelId } from "@/lib/agnes/types";
 import { chatCompletion } from "@/lib/agnes/upstream";
+import { normalizeDialogueJson } from "@/lib/agnes/story-format";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const TEXT_MAX = 12_000;
-const CONTINUE_MAX = 1;
 const STORYBOARD_CHAT_MS = 70_000;
-const STORYBOARD_CONTINUE_MS = 40_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -116,23 +107,6 @@ function shapeCharacters(raw: unknown, style: string): CharacterOut[] {
   return characters;
 }
 
-function parseStoryFps(value: unknown): V20Fps {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-  return (V20_FPS_OPTIONS as readonly number[]).includes(n) ? (n as V20Fps) : DEFAULT_FRAME_RATE;
-}
-
-function parseStoryResolution(value: unknown): V20Resolution {
-  return typeof value === "string" && (V20_RESOLUTIONS as readonly string[]).includes(value)
-    ? (value as V20Resolution)
-    : DEFAULT_V20_RESOLUTION;
-}
-
-function parseStoryAspect(value: unknown): (typeof V20_ASPECTS)[number] {
-  return typeof value === "string" && (V20_ASPECTS as readonly string[]).includes(value)
-    ? (value as (typeof V20_ASPECTS)[number])
-    : "16:9";
-}
-
 function shapeScenes(
   raw: unknown,
   model: typeof MODEL_V20 | typeof MODEL_FLASH,
@@ -156,7 +130,12 @@ function shapeScenes(
     const cast = shapeCast(item.cast, names);
     scenes.push({
       title,
-      duration_sec: snapStoryDuration(Number.isFinite(durRaw) ? durRaw : 5, model, fps, maxFrames),
+      duration_sec: snapStoryDuration(
+        Number.isFinite(durRaw) ? durRaw : FLASH_STORY_SECONDS,
+        model,
+        fps,
+        maxFrames,
+      ),
       cast: cast.length > 0 ? cast : names.slice(0, 1),
       setting: field(item, "setting") || blob,
       subject: field(item, "subject"),
@@ -164,14 +143,10 @@ function shapeScenes(
       camera_movement: field(item, "camera_movement"),
       lighting: field(item, "lighting"),
       style: field(item, "style"),
-      dialogue: field(item, "dialogue") || "None.",
+      dialogue: normalizeDialogueJson(item.dialogue),
     });
   }
   return scenes;
-}
-
-function scenesTotal(scenes: SceneOut[]): number {
-  return scenes.reduce((sum, s) => sum + s.duration_sec, 0);
 }
 
 function trimToBudget(
@@ -225,10 +200,7 @@ export async function POST(request: Request): Promise<Response> {
     return jsonError(400, "Text is too long.");
   }
 
-  if (!isModelId(json.video_model)) {
-    return jsonError(400, `video_model must be ${MODEL_V20} or ${MODEL_FLASH}.`);
-  }
-  const videoModel = json.video_model;
+  const videoModel = MODEL_FLASH;
   const minutes = clampStoryMinutes(
     typeof json.target_minutes === "number"
       ? json.target_minutes
@@ -236,11 +208,8 @@ export async function POST(request: Request): Promise<Response> {
         ? Number(json.target_minutes)
         : 1,
   );
-  const fps = parseStoryFps(json.frame_rate);
-  const resolution = parseStoryResolution(json.resolution);
-  const aspect = parseStoryAspect(json.aspect_ratio);
-  const size = v20Size(resolution, aspect);
-  const maxFrames = maxFramesForPixels(size.width, size.height);
+  const fps = DEFAULT_FRAME_RATE;
+  const maxFrames = V20_MAX_FRAMES["720p"];
   const range = storySceneRange(minutes, videoModel, fps, maxFrames);
   const timeoutMs = chatTimeoutMs(range.max);
   const budget = minutes * 60;
@@ -298,42 +267,6 @@ export async function POST(request: Request): Promise<Response> {
   const names = characters.map((c) => c.name);
 
   let scenes = shapeScenes(parsed.scenes, videoModel, names, fps, maxFrames) ?? [];
-  let continues = 0;
-  while (
-    scenesTotal(scenes) < budget * 0.85 &&
-    scenes.length < STORY_SCENE_HARD_MAX &&
-    scenes.length < range.max &&
-    continues < CONTINUE_MAX
-  ) {
-    continues += 1;
-    const remaining = Math.max(1, budget - scenesTotal(scenes));
-    const more = await chatCompletion(
-      storyboardContinueMessages(
-        story,
-        scenes.map((s) => s.title),
-        remaining,
-        videoModel,
-        fps,
-        maxFrames,
-      ),
-      key,
-      STORYBOARD_CONTINUE_MS,
-    );
-    if (!more.ok) {
-      console.info("storyboard: continue skipped");
-      break;
-    }
-    let extraParsed: unknown;
-    try {
-      extraParsed = parseStoryboardContent(more.content);
-    } catch {
-      break;
-    }
-    if (!isRecord(extraParsed)) break;
-    const extra = shapeScenes(extraParsed.scenes, videoModel, names, fps, maxFrames);
-    if (!extra || extra.length === 0) break;
-    scenes = scenes.concat(extra).slice(0, STORY_SCENE_HARD_MAX);
-  }
 
   scenes = trimToBudget(
     scenes.map((s, i) => ({ ...s, title: s.title || `Scene ${i + 1}` })),
